@@ -1,128 +1,112 @@
-// /api/vrm.js  — Vercel Serverless Function
+// /api/vrm.js
 export default async function handler(req, res) {
-  // --- CORS ---
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(204).end();
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const vrm = (req.query.vrm || '').trim().toUpperCase();
+  const debug = String(req.query.debug || '') === '1';
 
-  // --- Read query ---
-  const vrm = String((req.query?.vrm || req.query?.VRM || "")).toUpperCase().replace(/\s+/g, "");
-  const debug = String(req.query?.debug || "") === "1";
-  if (!/^[A-Z0-9]{2,8}$/.test(vrm)) return res.status(400).json({ error: "Invalid VRM" });
-
-  // --- Env keys (set these in Vercel > Settings > Environment Variables) ---
-  const {
-    DVSA_CLIENT_ID,
-    DVSA_CLIENT_SECRET,
-    DVSA_API_KEY,
-    DVLA_API_KEY, // optional but recommended
-  } = process.env;
-
-  const calls = {}; // for debug output
-
-  let make = "", model = "", fuelType = "", colour = "", firstUsedDate = "", year = "";
-
-  // --- 1) DVSA OAuth token ---
-  try {
-    const tokenRes = await fetch(
-      "https://login.microsoftonline.com/a455b827-244f-4c97-b5b4-ce5d13b4d00c/oauth2/v2.0/token",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id: DVSA_CLIENT_ID,
-          client_secret: DVSA_CLIENT_SECRET,
-          scope: "https://tapi.dvsa.gov.uk/.default",
-          grant_type: "client_credentials",
-        }),
-      }
-    );
-
-    if (!tokenRes.ok) {
-      const body = await tokenRes.text();
-      calls.token = { status: tokenRes.status, body };
-      return res.status(502).json({ error: "DVSA token error", calls: debug ? calls : undefined });
-    }
-
-    const { access_token } = await tokenRes.json();
-
-    // --- 2) DVSA vehicles (primary) ---
-    const vRes = await fetch(
-      `https://tapi.dvsa.gov.uk/trade/vehicles?registration=${encodeURIComponent(vrm)}`,
-      { headers: { Authorization: `Bearer ${access_token}`, "x-api-key": DVSA_API_KEY } }
-    );
-
-    calls.dvsaVehicles = { status: vRes.status };
-    if (vRes.ok) {
-      const arr = await vRes.json();
-      const v = Array.isArray(arr) && arr[0] ? arr[0] : null;
-      if (v) {
-        make          = (v.make || "").trim();
-        model         = (v.model || "").trim();
-        fuelType      = (v.fuelType || "").trim();
-        colour        = (v.primaryColour || v.colour || "").trim();
-        firstUsedDate = v.firstUsedDate || firstUsedDate;
-      }
-    } else {
-      calls.dvsaVehicles.body = await vRes.text();
-    }
-
-    // --- 3) Fallback DVSA MOT tests (often contains model) ---
-    if (!model) {
-      const mRes = await fetch(
-        `https://tapi.dvsa.gov.uk/trade/vehicles/mot-tests?registration=${encodeURIComponent(vrm)}&pageSize=1`,
-        { headers: { Authorization: `Bearer ${access_token}`, "x-api-key": DVSA_API_KEY } }
-      );
-      calls.dvsaMotTests = { status: mRes.status };
-      if (mRes.ok) {
-        const arr = await mRes.json();
-        const v = Array.isArray(arr) && arr[0] ? arr[0] : null;
-        if (v) {
-          model ||= (v.model || "").trim();
-          make  ||= (v.make || "").trim();
-        }
-      } else {
-        calls.dvsaMotTests.body = await mRes.text();
-      }
-    }
-  } catch (e) {
-    calls.dvsaError = String(e?.message || e);
+  if (!vrm) {
+    return res.status(400).json({ error: 'Missing vrm param ?vrm=AB12CDE' });
   }
 
-  // --- 4) DVLA VES for year/confirm make ---
-  if (DVLA_API_KEY) {
+  const out = {
+    vrm, year: '', make: '', model: '', fuelType: '', colour: '', firstUsedDate: '',
+    calls: {}
+  };
+
+  // Helper to log safely
+  const log = (...args) => { if (debug) console.log(...args); };
+
+  // --- 1) DVSA: get OAuth token ---
+  async function getDvsaToken() {
+    const body = new URLSearchParams({
+      client_id: process.env.DVSA_CLIENT_ID,
+      client_secret: process.env.DVSA_CLIENT_SECRET,
+      scope: process.env.DVSA_SCOPE_URL,
+      grant_type: 'client_credentials',
+    });
+
+    const resp = await fetch(process.env.DVSA_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+
+    const text = await resp.text();
+    log('DVSA token status:', resp.status, 'body:', text.slice(0, 400));
+    if (!resp.ok) throw new Error(`DVSA token failed ${resp.status}`);
+    try { return JSON.parse(text).access_token; } catch { throw new Error('DVSA token parse error'); }
+  }
+
+  // --- 2) DVSA: vehicle details (if token works) ---
+  async function fromDvsa() {
     try {
-      const dRes = await fetch(
-        "https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles",
-        {
-          method: "POST",
-          headers: { "x-api-key": DVLA_API_KEY, "Content-Type": "application/json" },
-          body: JSON.stringify({ registrationNumber: vrm }),
+      const token = await getDvsaToken();
+      const url = `https://beta.check-mot.service.gov.uk/trade/vehicles?registration=${encodeURIComponent(vrm)}`;
+      const r = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'x-api-key': process.env.DVSA_API_KEY,
+          'Accept': 'application/json'
         }
-      );
-      calls.dvla = { status: dRes.status };
-      if (dRes.ok) {
-        const d = await dRes.json();
-        year      = String(d.yearOfManufacture || year || "");
-        make    ||= (d.make || "").trim();
-        fuelType ||= (d.fuelType || "").trim();
-        colour   ||= (d.colour || "").trim();
+      });
+      const text = await r.text();
+      log('DVSA vehicles status:', r.status, 'body:', text.slice(0, 800));
+      out.calls.dvsa = { status: r.status };
+
+      if (r.ok) {
+        // DVSA returns an array; we'll pick the first
+        const arr = JSON.parse(text);
+        const v = Array.isArray(arr) ? arr[0] : arr;
+        if (v) {
+          out.year = String(v.yearOfManufacture || out.year);
+          out.make = v.make || out.make;
+          out.model = v.model || out.model;
+          out.fuelType = v.fuelType || out.fuelType;
+          out.colour = v.colour || out.colour;
+          out.firstUsedDate = v.monthOfFirstRegistration || out.firstUsedDate;
+        }
       } else {
-        calls.dvla.body = await dRes.text();
+        out.calls.dvsaError = 'fetch failed';
       }
     } catch (e) {
-      calls.dvlaError = String(e?.message || e);
+      log('DVSA error:', e?.message || e);
+      out.calls.dvsaError = e?.message || String(e);
     }
   }
 
-  // --- Normalise model (simple tidy) ---
-  const tidy = s => (s || "").toString().trim();
-  const cap  = s => tidy(s).split(" ").map(w => w[0] ? (w[0].toUpperCase()+w.slice(1).toLowerCase()) : "").join(" ");
-  if (model) model = cap(model);
+  // --- 3) DVLA (VES) as a fallback for make/year/colour ---
+  async function fromDvla() {
+    try {
+      const r = await fetch('https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.DVLA_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ registrationNumber: vrm })
+      });
 
-  // --- Response ---
-  const result = { vrm, year, make: cap(make), model, fuelType, colour, firstUsedDate };
-  if (debug) result.calls = calls;
-  return res.json(result);
+      const text = await r.text();
+      log('DVLA status:', r.status, 'body:', text.slice(0, 800));
+      out.calls.dvla = { status: r.status };
+
+      if (r.ok) {
+        const v = JSON.parse(text);
+        out.year = String(v.yearOfManufacture || out.year);
+        out.make = v.make || out.make;
+        out.colour = v.colour || out.colour;
+        out.fuelType = v.fuelType || out.fuelType;
+      }
+    } catch (e) {
+      log('DVLA error:', e?.message || e);
+      out.calls.dvlaError = e?.message || String(e);
+    }
+  }
+
+  // Run DVSA first (for model), DVLA second (extras)
+  await fromDvsa();
+  await fromDvla();
+
+  // Return aggregated view
+  return res.status(200).json(out);
 }
