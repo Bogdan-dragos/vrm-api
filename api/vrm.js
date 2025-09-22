@@ -11,9 +11,7 @@ export default async function handler(req, res) {
 
   const out = {
     vrm, year: '', make: '', model: '', fuelType: '', colour: '', firstUsedDate: '',
-    type: '', // new field
-    description: '', // make+model+type for display
-    calls: {}
+    type: '', description: '', calls: {}
   };
 
   // --- 1) DVSA TOKEN ---
@@ -29,6 +27,7 @@ export default async function handler(req, res) {
         grant_type: 'client_credentials',
       }),
     });
+
     const tokenData = await tokenResp.json();
     if (debug) out.calls.dvsaToken = { status: tokenResp.status, body: tokenData };
 
@@ -38,7 +37,7 @@ export default async function handler(req, res) {
     out.calls.dvsaError = `Token error: ${e.message}`;
   }
 
-  // --- 2) DVSA VEHICLE (provides detailed model/variant) ---
+  // --- 2) DVSA VEHICLE (production endpoint) ---
   if (token) {
     try {
       const url = `https://history.mot.api.gov.uk/v1/trade/vehicles/registration/${encodeURIComponent(vrm)}`;
@@ -56,12 +55,11 @@ export default async function handler(req, res) {
       if (vResp.ok && vJson) {
         out.make     = vJson.make     || out.make;
         out.model    = vJson.model    || out.model;
-        out.type     = vJson.modelDetail || vJson.variant || ""; // DVSA often calls this "modelDetail"
+        out.type     = vJson.modelDetail || vJson.variant || "";
         out.fuelType = vJson.fuelType || out.fuelType;
         out.colour   = vJson.colour   || out.colour;
         if (vJson.yearOfManufacture) out.year = String(vJson.yearOfManufacture);
 
-        // Build a nice description
         out.description = [out.make, out.model, out.type].filter(Boolean).join(" ");
       }
     } catch (e) {
