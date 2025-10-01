@@ -1,98 +1,65 @@
-// /api/vrm.js
+// api/vrm.js
+
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  const vrm = (req.query.vrm || '').trim().toUpperCase();
-  const debug = String(req.query.debug || '') === '1';
-
-  if (!vrm) {
-    return res.status(400).json({ error: 'Missing vrm param ?vrm=AB12CDE' });
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    return res.status(204).end();
   }
 
-  const out = {
-    vrm, year: '', make: '', model: '', fuelType: '', colour: '', firstUsedDate: '',
-    type: '', description: '', calls: {}
-  };
-
-  // --- 1) DVSA TOKEN ---
-  let token = '';
   try {
-    const tokenResp = await fetch(process.env.DVSA_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: process.env.DVSA_CLIENT_ID,
-        client_secret: process.env.DVSA_CLIENT_SECRET,
-        scope: process.env.DVSA_SCOPE_URL,
-        grant_type: 'client_credentials',
-      }),
-    });
-
-    const tokenData = await tokenResp.json();
-    if (debug) out.calls.dvsaToken = { status: tokenResp.status, body: tokenData };
-
-    if (!tokenResp.ok) throw new Error(`DVSA token failed (${tokenResp.status})`);
-    token = tokenData.access_token;
-  } catch (e) {
-    out.calls.dvsaError = `Token error: ${e.message}`;
-  }
-
-  // --- 2) DVSA VEHICLE (production endpoint) ---
-  if (token) {
-    try {
-      const url = `https://history.mot.api.gov.uk/v1/trade/vehicles/registration/${encodeURIComponent(vrm)}`;
-      const vResp = await fetch(url, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'X-API-Key': process.env.DVSA_API_KEY,
-          'Accept': 'application/json'
-        }
-      });
-
-      const vJson = await vResp.json().catch(() => null);
-      if (debug) out.calls.dvsaVehicles = { status: vResp.status, body: vJson };
-
-      if (vResp.ok && vJson) {
-        out.make     = vJson.make     || out.make;
-        out.model    = vJson.model    || out.model;
-        out.type     = vJson.modelDetail || vJson.variant || "";
-        out.fuelType = vJson.fuelType || out.fuelType;
-        out.colour   = vJson.colour   || out.colour;
-        if (vJson.yearOfManufacture) out.year = String(vJson.yearOfManufacture);
-
-        out.description = [out.make, out.model, out.type].filter(Boolean).join(" ");
-      }
-    } catch (e) {
-      out.calls.dvsaError = `Vehicle fetch error: ${e.message}`;
+    const { vrm } = req.query;
+    if (!vrm) {
+      return res.status(400).json({ error: 'Missing vrm' });
     }
-  }
 
-  // --- 3) DVLA fallback (year/make/colour/fuel) ---
-  try {
-    const dResp = await fetch('https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles', {
-      method: 'POST',
+    // ---- VehicleDataGlobal Call ----
+    const VDG_API_KEY = process.env.VDG_API_KEY;
+    if (!VDG_API_KEY) {
+      throw new Error('VDG_API_KEY not set in Vercel env');
+    }
+
+    // 🔧 Adjust this URL once you have the official docs
+    const vdgUrl = `https://api.vehicledataglobal.com/uk/lookup?vrm=${encodeURIComponent(
+      vrm
+    )}`;
+
+    const vdgRes = await fetch(vdgUrl, {
       headers: {
-        'x-api-key': process.env.DVLA_API_KEY,
-        'Content-Type': 'application/json'
+        'accept': 'application/json',
+        'x-api-key': VDG_API_KEY, // <-- common auth style
       },
-      body: JSON.stringify({ registrationNumber: vrm })
     });
 
-    const dData = await dResp.json();
-    if (debug) out.calls.dvla = { status: dResp.status, body: dData };
-
-    if (dResp.ok) {
-      out.year     = String(dData.yearOfManufacture || out.year || '');
-      out.make     = dData.make   || out.make;
-      out.colour   = dData.colour || out.colour;
-      out.fuelType = dData.fuelType || out.fuelType;
-      if (!out.description) {
-        out.description = [out.make, out.model, out.type].filter(Boolean).join(" ");
-      }
+    if (!vdgRes.ok) {
+      const text = await vdgRes.text();
+      throw new Error(`VDG error (${vdgRes.status}): ${text}`);
     }
-  } catch (e) {
-    out.calls.dvlaError = e.message;
-  }
 
-  return res.status(200).json(out);
+    const vdgJson = await vdgRes.json();
+
+    // ---- Map fields to your Shopify frontend ----
+    const payload = {
+      vrm: vrm.toUpperCase(),
+      year: vdgJson?.year || vdgJson?.registrationYear || '',
+      make: vdgJson?.make || '',
+      model: vdgJson?.model || '',
+      fuelType: vdgJson?.fuelType || '',
+      colour: vdgJson?.colour || '',
+      variant:
+        vdgJson?.variant ||
+        vdgJson?.trim ||
+        vdgJson?.details?.variantName ||
+        '',
+    };
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(200).json(payload);
+  } catch (err) {
+    console.error(err);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.status(500).json({ error: err.message || 'Lookup failed' });
+  }
 }
