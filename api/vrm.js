@@ -1,21 +1,24 @@
 // api/vrm.js
-// Partsworth VRM lookup (non-breaking).
-// Order: DVLA (make/year) -> DVSA (model) -> VDG (variant).
-// Always returns 200 with best-effort fields.
-// Add &debug=1 to see all provider attempts (status + short sample).
+// Partsworth VRM lookup – no fake variants.
+// Sources:
+//   DVLA  -> make, year, (fuel/colour if present)
+//   DVSA  -> model, (derivative/trim if present)  [legacy API-key; optional TAPI OAuth]
+//   VDG   -> variant (modelDetails.modelIdentification.modelVariant)
+// Behaviour:
+//   - Returns 200 always with best-effort fields
+//   - "variant" ONLY from VDG or DVSA (never composed)
+//   - &debug=1 shows all attempts (status + short sample)
 
-/* ---------------- CORS ---------------- */
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
-/* ---------------- utils ---------------- */
 const SAMPLE_LEN = 800;
 
-function trim(v) { return (v == null ? '' : String(v)).trim(); }
-function pick(...vals) { for (const v of vals) { const t = trim(v); if (t) return t; } return ''; }
+const t = (v) => (v == null ? '' : String(v)).trim();
+const pick = (...vals) => { for (const v of vals) { const s = t(v); if (s) return s; } return ''; };
 
 async function fetchBody(url, init = {}, timeoutMs = 10000) {
   const controller = new AbortController();
@@ -24,7 +27,7 @@ async function fetchBody(url, init = {}, timeoutMs = 10000) {
     const resp = await fetch(url, { ...init, signal: controller.signal });
     const text = await resp.text();
     let json = null;
-    try { json = JSON.parse(text); } catch { /* not JSON */ }
+    try { json = JSON.parse(text); } catch {}
     return { ok: resp.ok, status: resp.status, json, text, ct: resp.headers.get('content-type') || '' };
   } catch (e) {
     return { ok: false, status: 0, json: null, text: String(e?.message || e) };
@@ -33,47 +36,41 @@ async function fetchBody(url, init = {}, timeoutMs = 10000) {
   }
 }
 
-function mergePayload(base, add) {
+function mergeBase(base, add) {
   const out = { ...base };
-  for (const k of ['year','make','model','fuelType','colour','variant']) {
-    if (!trim(out[k]) && trim(add[k])) out[k] = trim(add[k]);
+  for (const k of ['year','make','model','fuelType','colour']) {
+    if (!t(out[k]) && t(add[k])) out[k] = t(add[k]);
   }
+  // variant handled separately: we NEVER compose it
+  if (!t(out.variant) && t(add.variant)) out.variant = t(add.variant);
   return out;
 }
 
-/* ---------------- mappers ---------------- */
-// DVLA (UK VES) common response: POST /vehicle-enquiry/v1/vehicles {registrationNumber}
-// fields vary; we pull make + year (and fuel/colour if present)
+/* ---------- MAPPERS ---------- */
 function mapDVLA(j) {
   const src = j?.data || j || {};
-  const year = pick(src.yearOfManufacture, src.year);
   return {
-    year,
+    year: pick(src.yearOfManufacture, src.year),
     make: pick(src.make, src.dvlaMake),
     model: pick(src.model, src.dvlaModel),
     fuelType: pick(src.fuelType, src.dvlaFuelType),
     colour: pick(src.colour, src.color),
-    variant: ''
+    variant: '' // DVLA doesn't provide true variant
   };
 }
-
-// DVSA legacy MOT API (x-api-key). We only need model (but map extras if present)
 function mapDVSA_Legacy(j) {
-  // legacy endpoint returns an array of tests or vehicles; pull first vehicle-level fields
   const arr = Array.isArray(j) ? j : (Array.isArray(j?.data) ? j.data : []);
   const first = arr[0] || {};
-  const vehicle = first?.vehicle || first || {};
+  const v = first?.vehicle || first || {};
   return {
-    year: pick(vehicle.year, vehicle.firstUsedDate?.slice?.(0,4)),
-    make: pick(vehicle.make),
-    model: pick(vehicle.model),
-    fuelType: pick(vehicle.fuelType),
-    colour: pick(vehicle.colour),
-    variant: pick(vehicle.derivative, vehicle.trim)
+    year: pick(v.year, v.firstUsedDate?.slice?.(0,4)),
+    make: pick(v.make),
+    model: pick(v.model),
+    fuelType: pick(v.fuelType),
+    colour: pick(v.colour),
+    variant: pick(v.derivative, v.trim) // MAYBE present
   };
 }
-
-// DVSA TAPI (OAuth). Shape varies by endpoint; we still just try to extract model.
 function mapDVSA_TAPI(j) {
   const v = j?.vehicle || j?.data || j || {};
   return {
@@ -85,107 +82,97 @@ function mapDVSA_TAPI(j) {
     variant: pick(v.derivative, v.trim)
   };
 }
-
-// VDG r2/lookup VehicleDetails → modelDetails.modelIdentification.modelVariant
 function mapVDG(j) {
-  const r = j?.results || {};
-  const vid   = r?.vehicleDetails?.vehicleIdentification || {};
+  const r   = j?.results || {};
+  const vid = r?.vehicleDetails?.vehicleIdentification || {};
   const vhist = r?.vehicleDetails?.vehicleHistory || {};
-  const mid   = r?.modelDetails?.modelIdentification || {};
-  const pwr   = r?.modelDetails?.powertrain || {};
+  const mid = r?.modelDetails?.modelIdentification || {};
+  const pwr = r?.modelDetails?.powertrain || {};
 
-  const year =
-    vid?.yearOfManufacture ||
-    (typeof vid?.dateOfManufacture === 'string' ? vid.dateOfManufacture.slice(0,4) : '');
+  const year = pick(vid?.yearOfManufacture,
+                    typeof vid?.dateOfManufacture === 'string' ? vid.dateOfManufacture.slice(0,4) : '');
 
   return {
-    year: trim(year),
-    make: pick(mid?.make, vid?.dvlaMake),
+    year: t(year),
+    make: pick(mid?.make,  vid?.dvlaMake),
     model: pick(mid?.model, vid?.dvlaModel),
     fuelType: pick(vid?.dvlaFuelType, pwr?.fuelType),
     colour: pick(vhist?.colourDetails?.currentColour),
-    variant: pick(mid?.modelVariant)
+    variant: t(mid?.modelVariant) // ONLY source we trust for variant
   };
 }
 
-/* ---------------- providers ---------------- */
+/* ---------- PROVIDERS ---------- */
 async function tryDVLA(vrm, attempts) {
-  // Default to official DVLA VES endpoint; override with DVLA_API_URL if you use your proxy
-  const dvlaUrl = process.env.DVLA_API_URL || 'https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles';
-  const dvlaKey = process.env.DVLA_API_KEY;
-  if (!dvlaUrl || !dvlaKey) return null;
+  const url = process.env.DVLA_API_URL || 'https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles';
+  const key = process.env.DVLA_API_KEY;
+  if (!url || !key) return null;
 
-  const { ok, status, json, text } = await fetchBody(dvlaUrl, {
+  const r = await fetchBody(url, {
     method: 'POST',
-    headers: { 'x-api-key': dvlaKey, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    headers: { 'x-api-key': key, 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({ registrationNumber: vrm })
   });
-
-  attempts.push({ provider: 'DVLA', url: dvlaUrl, status, sample: text.slice(0, SAMPLE_LEN) });
-  if (!ok || !json) return null;
-
-  return mapDVLA(json);
+  attempts.push({ provider: 'DVLA', url, status: r.status, sample: (r.text || '').slice(0, SAMPLE_LEN) });
+  if (!r.ok || !r.json) return null;
+  return mapDVLA(r.json);
 }
 
 async function tryDVSA_Legacy(vrm, attempts) {
-  // Legacy API-key MOT endpoint
-  const dvsaKey = process.env.DVSA_API_KEY;
-  const dvsaLegacyBase = process.env.DVSA_API_URL || 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests';
-  if (!dvsaKey || !dvsaLegacyBase) return null;
+  const key = process.env.DVSA_API_KEY;
+  const base = process.env.DVSA_API_URL || 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests';
+  if (!key || !base) return null;
 
-  const u = new URL(dvsaLegacyBase);
+  const u = new URL(base);
   u.searchParams.set('registration', vrm);
 
-  const { ok, status, json, text } = await fetchBody(u.toString(), {
+  const r = await fetchBody(u.toString(), {
     method: 'GET',
-    headers: { 'x-api-key': dvsaKey, 'Accept': 'application/json' }
+    headers: { 'x-api-key': key, 'Accept': 'application/json' }
   });
-
-  attempts.push({ provider: 'DVSA-legacy', url: u.toString(), status, sample: text.slice(0, SAMPLE_LEN) });
-  if (!ok || !json) return null;
-
-  return mapDVSA_Legacy(json);
+  attempts.push({ provider: 'DVSA-legacy', url: u.toString(), status: r.status, sample: (r.text || '').slice(0, SAMPLE_LEN) });
+  if (!r.ok || !r.json) return null;
+  return mapDVSA_Legacy(r.json);
 }
 
 async function tryDVSA_TAPI(vrm, attempts) {
-  // Optional OAuth client-credentials flow (if/when you add a TAPI URL)
   const tokenUrl = process.env.DVSA_TOKEN_URL;
   const clientId = process.env.DVSA_CLIENT_ID;
   const clientSecret = process.env.DVSA_CLIENT_SECRET;
   const scope = process.env.DVSA_SCOPE_URL;
-  const apiUrl = process.env.DVSA_TAPI_URL; // <- optional; if not set, skip TAPI
+  const apiUrl = process.env.DVSA_TAPI_URL; // set this if you're using TAPI
 
   if (!tokenUrl || !clientId || !clientSecret || !scope || !apiUrl) return null;
 
-  // Get access token
   const form = new URLSearchParams();
   form.set('grant_type', 'client_credentials');
   form.set('client_id', clientId);
   form.set('client_secret', clientSecret);
   form.set('scope', scope);
 
-  const tokenRes = await fetchBody(tokenUrl, {
+  const tok = await fetchBody(tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: form.toString()
   });
-
-  attempts.push({ provider: 'DVSA-token', url: tokenUrl, status: tokenRes.status, sample: tokenRes.text.slice(0, SAMPLE_LEN) });
-  const accessToken = tokenRes.json?.access_token;
+  attempts.push({ provider: 'DVSA-token', url: tokenUrl, status: tok.status, sample: (tok.text || '').slice(0, SAMPLE_LEN) });
+  const accessToken = tok.json?.access_token;
   if (!accessToken) return null;
 
   const u = new URL(apiUrl);
   u.searchParams.set('vrm', vrm);
 
-  const { ok, status, json, text } = await fetchBody(u.toString(), {
+  const r = await fetchBody(u.toString(), {
     method: 'GET',
     headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
   });
+  attempts.push({ provider: 'DVSA-TAPI', url: u.toString(), status: r.status, sample: (r.text || '').slice(0, SAMPLE_LEN) });
+  if (!r.ok || !r.json) return null;
+  return mapDVSA_TAPI(r.json);
+}
 
-  attempts.push({ provider: 'DVSA-TAPI', url: u.toString(), status, sample: text.slice(0, SAMPLE_LEN) });
-  if (!ok || !json) return null;
-
-  return mapDVSA_TAPI(json);
+function vdgSuccess(j) {
+  return Boolean(j?.responseInformation?.isSuccessStatusCode === true && j?.results);
 }
 
 async function tryVDG(vrm, attempts) {
@@ -194,64 +181,70 @@ async function tryVDG(vrm, attempts) {
   const pkg = process.env.VDG_PACKAGE || 'VehicleDetails';
   if (!key) return null;
 
-  const endpoint = `${base}/r2/lookup`;
+  // Try POST JSON first
+  const url = `${base}/r2/lookup`;
   const body = { apiKey: key, packageName: pkg, searchType: 'Registration', searchTerm: vrm };
 
-  const { ok, status, json, text } = await fetchBody(endpoint, {
+  let r = await fetchBody(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify(body)
   });
+  attempts.push({ provider: 'VDG', method: 'POST', url, status: r.status, sample: (r.text || '').slice(0, SAMPLE_LEN) });
+  if (r.ok && r.json && vdgSuccess(r.json)) return mapVDG(r.json);
 
-  attempts.push({ provider: 'VDG', url: endpoint, status, sample: text.slice(0, SAMPLE_LEN) });
-  if (!ok || !json || json?.responseInformation?.isSuccessStatusCode !== true) return null;
+  // Fallback: GET with PascalCase query params
+  const u = new URL(url);
+  u.searchParams.set('apiKey', key);
+  u.searchParams.set('packageName', pkg);
+  u.searchParams.set('SearchType', 'Registration');
+  u.searchParams.set('SearchTerm', vrm);
 
-  return mapVDG(json);
+  r = await fetchBody(u.toString(), { method: 'GET', headers: { Accept: 'application/json' }, cache: 'no-store' });
+  attempts.push({ provider: 'VDG', method: 'GET', url: u.toString().replace(/(apiKey=)[^&]+/, '$1***'), status: r.status, sample: (r.text || '').slice(0, SAMPLE_LEN) });
+  if (r.ok && r.json && vdgSuccess(r.json)) return mapVDG(r.json);
+
+  return null;
 }
 
-/* ---------------- route ---------------- */
+/* ---------- ROUTE ---------- */
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') { setCORS(res); return res.status(204).end(); }
   setCORS(res);
 
   try {
-    const plate = String(req.query?.vrm || '').trim().toUpperCase();
+    const plate = t(req.query?.vrm || '').toUpperCase();
     const debugMode = req.query?.debug === '1';
     if (!plate) return res.status(400).json({ error: 'Missing vrm' });
 
-    // Base payload schema for Shopify
     let payload = { vrm: plate, year:'', make:'', model:'', fuelType:'', colour:'', variant:'' };
     const attempts = [];
 
-    // 1) DVLA (year+make)
+    // 1) DVLA
     const dvla = await tryDVLA(plate, attempts);
-    if (dvla) payload = mergePayload(payload, dvla);
+    if (dvla) payload = mergeBase(payload, dvla);
 
-    // 2) DVSA legacy (model); else try TAPI if configured
+    // 2) DVSA legacy -> TAPI
     const dvsaLegacy = await tryDVSA_Legacy(plate, attempts);
-    if (dvsaLegacy) payload = mergePayload(payload, dvsaLegacy);
+    if (dvsaLegacy) payload = mergeBase(payload, dvsaLegacy);
     else {
       const dvsaTapi = await tryDVSA_TAPI(plate, attempts);
-      if (dvsaTapi) payload = mergePayload(payload, dvsaTapi);
+      if (dvsaTapi) payload = mergeBase(payload, dvsaTapi);
     }
 
     // 3) VDG (variant)
     const vdg = await tryVDG(plate, attempts);
-    if (vdg) payload = mergePayload(payload, vdg);
+    if (vdg) payload = mergeBase(payload, vdg);
 
-    // UX fallback if variant still empty
-    if (!trim(payload.variant)) {
-      const composed = [payload.year, payload.make, payload.model, payload.fuelType].filter(Boolean).join(' ');
-      if (composed) payload.variant = composed;
-    }
+    // IMPORTANT: DO NOT compose "variant". Leave empty if none found.
+    // (No change here — we intentionally avoid making up a variant.)
 
     if (debugMode) return res.status(200).json({ ...payload, _debug: { attempts } });
     return res.status(200).json(payload);
 
   } catch {
-    // Non-breaking fallback
     return res.status(200).json({
-      vrm: String(req.query?.vrm || '').toUpperCase(),
+      vrm: t(req.query?.vrm || '').toUpperCase(),
       year:'', make:'', model:'', fuelType:'', colour:'', variant:'',
       note:'Minimal return due to server error'
     });
