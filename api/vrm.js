@@ -1,9 +1,13 @@
 // api/vrm.js
-// Partsworth VRM lookup tuned for: reliable model + clean variant.
-// - model: DVSA -> VDG -> DVLA
-// - variant: VDG.modelVariant -> DVSA.derivative/trim (never composed)
-// - variant cleaner removes year/make/fuel tokens.
-// - Always 200; add &debug=1 for provider attempts.
+// Partsworth VRM lookup with VDG path-shape fixes.
+// - MODEL: DVSA -> VDG -> DVLA
+// - VARIANT: VDG.modelVariant -> DVSA.derivative/trim (never composed)
+// - VDG tries these in order (stop at first success with non-empty variant):
+//    1) GET  /r2/lookup/Registration/{vrm}?apiKey=...&packageName=...
+//    2) GET  /r2/lookup?apiKey=...&packageName=...&SearchType=Registration&SearchTerm={vrm}
+//    3) POST /r2/lookup (JSON body, PascalCase keys)
+//    4) POST /r2/lookup (JSON body, lowercase keys)
+// Always returns 200; add &debug=1 for provider attempts.
 
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -14,7 +18,7 @@ const SLICE = 800;
 const s = v => (v == null ? '' : String(v)).trim();
 const pick = (...vals) => { for (const v of vals) { const x = s(v); if (x) return x; } return ''; };
 
-async function fetchBody(url, init = {}, timeoutMs = 10000) {
+async function fetchBody(url, init = {}, timeoutMs = 12000) {
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const resp = await fetch(url, { ...init, signal: ctl.signal });
@@ -26,45 +30,6 @@ async function fetchBody(url, init = {}, timeoutMs = 10000) {
   } finally { clearTimeout(to); }
 }
 
-/* ------------------ HELPERS ------------------ */
-function mergeBase(target, src) {
-  const out = { ...target };
-  // fill model/make/year/fuel/colour if missing
-  for (const k of ['model','make','year','fuelType','colour']) {
-    if (!s(out[k]) && s(src[k])) out[k] = s(src[k]);
-  }
-  // variant only from real sources; never compose
-  if (!s(out.variant) && s(src.variant)) out.variant = s(src.variant);
-  return out;
-}
-
-// Remove leading year, make name, and fuel tokens from variant
-function cleanVariant(variant, make) {
-  let v = s(variant);
-  if (!v) return v;
-
-  // 1) strip leading 4-digit year
-  v = v.replace(/^\s*(19|20)\d{2}\s+/i, '');
-
-  // 2) strip exact make at start (AUDI, BMW, etc.)
-  if (make) {
-    const esc = make.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    v = v.replace(new RegExp(`^\\s*${esc}\\s+`, 'i'), '');
-  }
-
-  // 3) remove lone fuel tokens at start/end
-  const fuelTokens = ['DIESEL','PETROL','ELECTRIC','HYBRID','PHEV','HEV','MHEV','GAS','LPG'];
-  const tokRegex = new RegExp(`\\b(${fuelTokens.join('|')})\\b`, 'i');
-  // leading
-  v = v.replace(new RegExp(`^\\s*${tokRegex.source}\\s+`, 'i'), '');
-  // trailing
-  v = v.replace(new RegExp(`\\s+${tokRegex.source}\\s*$`, 'i'), '');
-
-  // collapse extra spaces
-  v = v.replace(/\s{2,}/g, ' ').trim();
-  return v;
-}
-
 /* ------------------ MAPPERS ------------------ */
 function mapDVLA(j) {
   const v = j?.data || j || {};
@@ -74,12 +39,10 @@ function mapDVLA(j) {
     model: pick(v.model, v.dvlaModel),
     fuelType: pick(v.fuelType, v.dvlaFuelType),
     colour: pick(v.colour, v.color),
-    variant: '' // DVLA doesn't provide a true variant
+    variant: '' // DVLA doesn't provide trim/variant reliably
   };
 }
-
 function mapDVSA_Legacy(j) {
-  // DVSA legacy returns an array (tests) with embedded vehicle info
   const arr = Array.isArray(j) ? j : (Array.isArray(j?.data) ? j.data : []);
   const first = arr[0] || {};
   const v = first?.vehicle || first || {};
@@ -89,10 +52,9 @@ function mapDVSA_Legacy(j) {
     model: pick(v.model),
     fuelType: pick(v.fuelType),
     colour: pick(v.colour),
-    variant: pick(v.derivative, v.trim)
+    variant: pick(v.derivative, v.trim) // fallback variant if VDG has none
   };
 }
-
 function mapDVSA_TAPI(j) {
   const v = j?.vehicle || j?.data || j || {};
   return {
@@ -104,18 +66,16 @@ function mapDVSA_TAPI(j) {
     variant: pick(v.derivative, v.trim)
   };
 }
-
 function mapVDG_Generic(j) {
-  const r = j?.results || {};
+  const r   = j?.results || {};
   const vid = r?.vehicleDetails?.vehicleIdentification || {};
   const vhist = r?.vehicleDetails?.vehicleHistory || {};
-  const mid  = r?.modelDetails?.modelIdentification || {};
-  const pwr  = r?.modelDetails?.powertrain || {};
-  const sad  = r?.specAndOptionsDetails || r?.specAndOptions || {};
-
+  const mid = r?.modelDetails?.modelIdentification || {};
+  const pwr = r?.modelDetails?.powertrain || {};
+  const sad = r?.specAndOptionsDetails || r?.specAndOptions || {};
   return {
     year: pick(vid?.yearOfManufacture, typeof vid?.dateOfManufacture === 'string' ? vid.dateOfManufacture.slice(0,4) : ''),
-    make: pick(mid?.make, vid?.dvlaMake),
+    make: pick(mid?.make,  vid?.dvlaMake),
     model: pick(mid?.model, vid?.dvlaModel),
     fuelType: pick(vid?.dvlaFuelType, pwr?.fuelType),
     colour: pick(vhist?.colourDetails?.currentColour),
@@ -133,28 +93,26 @@ async function tryDVLA(vrm, attempts) {
     headers: { 'x-api-key': key, 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({ registrationNumber: vrm })
   });
-  attempts.push({ provider: 'DVLA', url, status: r.status, sample: (r.text||'').slice(0,SLICE) });
+  attempts.push({ provider:'DVLA', url, status:r.status, sample:(r.text||'').slice(0,SLICE) });
   if (!r.ok || !r.json) return null;
   return mapDVLA(r.json);
 }
-
 async function tryDVSA_Legacy(vrm, attempts) {
   const key = process.env.DVSA_API_KEY;
   const base = process.env.DVSA_API_URL || 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests';
   if (!key || !base) return null;
   const u = new URL(base); u.searchParams.set('registration', vrm);
-  const r = await fetchBody(u.toString(), { method: 'GET', headers: { 'x-api-key': key, 'Accept': 'application/json' } });
-  attempts.push({ provider: 'DVSA-legacy', url: u.toString(), status: r.status, sample: (r.text||'').slice(0,SLICE) });
+  const r = await fetchBody(u.toString(), { method:'GET', headers:{ 'x-api-key': key, 'Accept':'application/json' } });
+  attempts.push({ provider:'DVSA-legacy', url:u.toString(), status:r.status, sample:(r.text||'').slice(0,SLICE) });
   if (!r.ok || !r.json) return null;
   return mapDVSA_Legacy(r.json);
 }
-
 async function tryDVSA_TAPI(vrm, attempts) {
   const tokenUrl = process.env.DVSA_TOKEN_URL;
   const clientId = process.env.DVSA_CLIENT_ID;
   const clientSecret = process.env.DVSA_CLIENT_SECRET;
   const scope = process.env.DVSA_SCOPE_URL;
-  const apiUrl = process.env.DVSA_TAPI_URL; // optional
+  const apiUrl = process.env.DVSA_TAPI_URL; // optional; set if using TAPI
   if (!tokenUrl || !clientId || !clientSecret || !scope || !apiUrl) return null;
 
   const form = new URLSearchParams();
@@ -162,54 +120,75 @@ async function tryDVSA_TAPI(vrm, attempts) {
   form.set('client_id',clientId);
   form.set('client_secret',clientSecret);
   form.set('scope',scope);
-
   const tok = await fetchBody(tokenUrl, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: form.toString() });
-  attempts.push({ provider:'DVSA-token', url: tokenUrl, status: tok.status, sample: (tok.text||'').slice(0,SLICE) });
+  attempts.push({ provider:'DVSA-token', url: tokenUrl, status: tok.status, sample:(tok.text||'').slice(0,SLICE) });
   const at = tok.json?.access_token; if (!at) return null;
 
   const u = new URL(apiUrl); u.searchParams.set('vrm', vrm);
   const r = await fetchBody(u.toString(), { method:'GET', headers:{ 'Authorization':`Bearer ${at}`, 'Accept':'application/json' } });
-  attempts.push({ provider:'DVSA-TAPI', url: u.toString(), status: r.status, sample: (r.text||'').slice(0,SLICE) });
+  attempts.push({ provider:'DVSA-TAPI', url:u.toString(), status:r.status, sample:(r.text||'').slice(0,SLICE) });
   if (!r.ok || !r.json) return null;
   return mapDVSA_TAPI(r.json);
 }
 
-// VDG with multiple packages + POST/GET fallback; returns ONLY if it finds a non-empty variant
+/* ------------------ VDG (tight shapes) ------------------ */
 async function tryVDG_ForVariant(vrm, attempts) {
   const base = (process.env.VDG_BASE || 'https://uk.api.vehicledataglobal.com').replace(/\/+$/,'');
   const key = process.env.VDG_API_KEY; if (!key) return null;
-  const pkgEnv = process.env.VDG_PACKAGE || 'VehicleDetails';
-  const packages = [pkgEnv, 'SpecAndOptionsDetails', 'VehicleDetailsWithImage']
-    .filter((v, i, a) => a.indexOf(v) === i);
+  const pkg = process.env.VDG_PACKAGE || 'VehicleDetails';
 
-  for (const pkg of packages) {
-    const url = `${base}/r2/lookup`;
-
-    // POST JSON
-    let r = await fetchBody(url, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'Accept':'application/json' },
-      body: JSON.stringify({ apiKey: key, packageName: pkg, searchType: 'Registration', searchTerm: vrm })
-    });
-    attempts.push({ provider:'VDG', pkg, method:'POST', url, status:r.status, sample:(r.text||'').slice(0,SLICE) });
-    if (r.ok && r.json && vdgOK(r.json)) {
-      const m = mapVDG_Generic(r.json);
-      if (s(m.variant)) return m;
-    }
-
-    // GET PascalCase
-    const u = new URL(url);
-    u.searchParams.set('apiKey', key);
-    u.searchParams.set('packageName', pkg);
-    u.searchParams.set('SearchType', 'Registration');
-    u.searchParams.set('SearchTerm', vrm);
-    r = await fetchBody(u.toString(), { method:'GET', headers:{ 'Accept':'application/json' }, cache:'no-store' });
-    attempts.push({ provider:'VDG', pkg, method:'GET', url:u.toString().replace(/(apiKey=)[^&]+/,'$1***'), status:r.status, sample:(r.text||'').slice(0,SLICE) });
+  // 1) GET /r2/lookup/Registration/{vrm}?apiKey=...&packageName=...
+  {
+    const url = new URL(`${base}/r2/lookup/Registration/${encodeURIComponent(vrm)}`);
+    url.searchParams.set('apiKey', key);
+    url.searchParams.set('packageName', pkg);
+    const r = await fetchBody(url.toString(), { method:'GET', headers:{ 'Accept':'application/json' }, cache:'no-store' });
+    attempts.push({ provider:'VDG', method:'GET', shape:'path-Registration', url:url.toString().replace(/(apiKey=)[^&]+/, '$1***'), status:r.status, sample:(r.text||'').slice(0,SLICE) });
     if (r.ok && r.json && vdgOK(r.json)) {
       const m = mapVDG_Generic(r.json);
       if (s(m.variant)) return m;
     }
   }
+
+  // 2) GET /r2/lookup?apiKey=...&packageName=...&SearchType=Registration&SearchTerm=VRM
+  {
+    const url = new URL(`${base}/r2/lookup`);
+    url.searchParams.set('apiKey', key);
+    url.searchParams.set('packageName', pkg);
+    url.searchParams.set('SearchType', 'Registration');
+    url.searchParams.set('SearchTerm', vrm);
+    const r = await fetchBody(url.toString(), { method:'GET', headers:{ 'Accept':'application/json' }, cache:'no-store' });
+    attempts.push({ provider:'VDG', method:'GET', shape:'query-Pascal', url:url.toString().replace(/(apiKey=)[^&]+/, '$1***'), status:r.status, sample:(r.text||'').slice(0,SLICE) });
+    if (r.ok && r.json && vdgOK(r.json)) {
+      const m = mapVDG_Generic(r.json);
+      if (s(m.variant)) return m;
+    }
+  }
+
+  // 3) POST JSON, PascalCase keys
+  {
+    const url = `${base}/r2/lookup`;
+    const body = { apiKey: key, packageName: pkg, SearchType:'Registration', SearchTerm: vrm };
+    const r = await fetchBody(url, { method:'POST', headers:{ 'Content-Type':'application/json','Accept':'application/json' }, body: JSON.stringify(body) });
+    attempts.push({ provider:'VDG', method:'POST', shape:'body-Pascal', url, status:r.status, sample:(r.text||'').slice(0,SLICE) });
+    if (r.ok && r.json && vdgOK(r.json)) {
+      const m = mapVDG_Generic(r.json);
+      if (s(m.variant)) return m;
+    }
+  }
+
+  // 4) POST JSON, lowercase keys
+  {
+    const url = `${base}/r2/lookup`;
+    const body = { apiKey: key, packageName: pkg, searchType:'Registration', searchTerm: vrm };
+    const r = await fetchBody(url, { method:'POST', headers:{ 'Content-Type':'application/json','Accept':'application/json' }, body: JSON.stringify(body) });
+    attempts.push({ provider:'VDG', method:'POST', shape:'body-lower', url, status:r.status, sample:(r.text||'').slice(0,SLICE) });
+    if (r.ok && r.json && vdgOK(r.json)) {
+      const m = mapVDG_Generic(r.json);
+      if (s(m.variant)) return m;
+    }
+  }
+
   return null;
 }
 
@@ -226,25 +205,43 @@ export default async function handler(req, res) {
     let payload = { vrm: plate, year:'', make:'', model:'', fuelType:'', colour:'', variant:'' };
     const attempts = [];
 
-    // 1) DVSA (model)
+    // MODEL path
     const dvsaLegacy = await tryDVSA_Legacy(plate, attempts);
-    if (dvsaLegacy) payload = mergeBase(payload, dvsaLegacy);
-    else {
-      const dvsaTapi = await tryDVSA_TAPI(plate, attempts);
-      if (dvsaTapi) payload = mergeBase(payload, dvsaTapi);
+    if (dvsaLegacy) payload = { ...payload, ...{ model: s(payload.model) ? payload.model : dvsaLegacy.model } };
+
+    if (!s(payload.model)) {
+      const dvla = await tryDVLA(plate, attempts);
+      if (dvla) {
+        // DVLA can also fill model if DVSA failed
+        if (!s(payload.model) && s(dvla.model)) payload.model = dvla.model;
+        // Keep make/year anyway
+        payload.make = s(payload.make) ? payload.make : dvla.make;
+        payload.year = s(payload.year) ? payload.year : dvla.year;
+        payload.fuelType = s(payload.fuelType) ? payload.fuelType : dvla.fuelType;
+        payload.colour   = s(payload.colour)   ? payload.colour   : dvla.colour;
+      }
     }
 
-    // 2) DVLA (make/year and sometimes model fallback)
-    const dvla = await tryDVLA(plate, attempts);
-    if (dvla) payload = mergeBase(payload, dvla);
+    if (!s(payload.model)) {
+      // Ask VDG for model too (it often has model in modelDetails)
+      const vdgModelTry = await tryVDG_ForVariant(plate, attempts);
+      if (vdgModelTry && s(vdgModelTry.model)) payload.model = vdgModelTry.model;
+      // we won't take its variant yet (tryVDG again below for freshest)
+    }
 
-    // 3) VDG (variant only if real)
+    // VARIANT path (strict, never composed)
     const vdg = await tryVDG_ForVariant(plate, attempts);
-    if (vdg) payload = mergeBase(payload, vdg);
-
-    // CLEAN the variant to remove year/make/fuel tokens
-    if (s(payload.variant)) {
-      payload.variant = cleanVariant(payload.variant, payload.make);
+    if (vdg && s(vdg.variant)) {
+      payload.variant = vdg.variant;
+      // also allow VDG to backfill model if still empty
+      if (!s(payload.model) && s(vdg.model)) payload.model = vdg.model;
+      // keep make/year/fuel/colour if missing
+      payload.make = s(payload.make) ? payload.make : vdg.make;
+      payload.year = s(payload.year) ? payload.year : vdg.year;
+      payload.fuelType = s(payload.fuelType) ? payload.fuelType : vdg.fuelType;
+      payload.colour   = s(payload.colour)   ? payload.colour   : vdg.colour;
+    } else if (!s(payload.variant) && dvsaLegacy && s(dvsaLegacy.variant)) {
+      payload.variant = dvsaLegacy.variant; // fallback only
     }
 
     if (debugMode) return res.status(200).json({ ...payload, _debug: { attempts } });
