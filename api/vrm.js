@@ -1,7 +1,15 @@
 // api/vrm.js
-// Calls VehicleDataGlobal r2/lookup for VehicleDetails.
-// Uses GET first; if VDG says SearchTerm missing, retries as POST JSON.
-// Env: VDG_URL = full URL template with {VRM} placeholder.
+// Robust VDG VehicleDetails lookup with multi-variant GET attempts.
+// It tries several param name/value combos (SearchType/Registration vs VRM, caps vs lower)
+// and returns the first successful payload. Add &debug=1 to see all attempts.
+//
+// Required env (set in Vercel → Settings → Environment Variables):
+//   VDG_BASE = https://uk.api.vehicledataglobal.com
+//   VDG_API_KEY = 656e7886-c004-4233-adbc-721d0112641b
+// Optional (defaults shown):
+//   VDG_PACKAGE = VehicleDetails
+//
+// Test:  https://vrm-api.vercel.app/api/vrm?vrm=AB12CDE&debug=1
 
 function maskUrl(u) {
   try {
@@ -14,7 +22,7 @@ function maskUrl(u) {
   } catch { return '***'; }
 }
 
-function buildDisplayPayload(plate, json) {
+function mapPayload(plate, json) {
   const payload = { vrm: plate, year: '', make: '', model: '', fuelType: '', colour: '', variant: '' };
   const r = json?.results || {};
   const vid = r?.vehicleDetails?.vehicleIdentification || {};
@@ -22,16 +30,14 @@ function buildDisplayPayload(plate, json) {
   const mid = r?.modelDetails?.modelIdentification || {};
   const pwr = r?.modelDetails?.powertrain || {};
 
-  payload.make   = String(mid?.make  || vid?.dvlaMake || '').trim();
-  payload.model  = String(mid?.model || vid?.dvlaModel || '').trim();
-  payload.variant= String(mid?.modelVariant || '').trim();
-
+  payload.make    = String(mid?.make  || vid?.dvlaMake  || '').trim();
+  payload.model   = String(mid?.model || vid?.dvlaModel || '').trim();
+  payload.variant = String(mid?.modelVariant || '').trim();
   const yom = vid?.yearOfManufacture;
   const dom = typeof vid?.dateOfManufacture === 'string' ? vid?.dateOfManufacture.slice(0,4) : '';
-  payload.year   = String(yom || dom || '').trim();
-
-  payload.fuelType = String(vid?.dvlaFuelType || pwr?.fuelType || '').trim();
-  payload.colour   = String(vhist?.colourDetails?.currentColour || '').trim();
+  payload.year    = String(yom || dom || '').trim();
+  payload.fuelType= String(vid?.dvlaFuelType || pwr?.fuelType || '').trim();
+  payload.colour  = String(vhist?.colourDetails?.currentColour || '').trim();
 
   return payload;
 }
@@ -51,82 +57,97 @@ export default async function handler(req, res) {
     const plate = String(vrm).trim().toUpperCase();
     if (!plate) return res.status(400).json({ error: 'Missing vrm' });
 
-    const tmpl = process.env.VDG_URL || '';
+    const BASE    = (process.env.VDG_BASE || 'https://uk.api.vehicledataglobal.com').replace(/\/+$/,'');
+    const API_KEY = process.env.VDG_API_KEY || '';
+    const PACKAGE = process.env.VDG_PACKAGE || 'VehicleDetails';
+
     const basePayload = { vrm: plate, year: '', make: '', model: '', fuelType: '', colour: '', variant: '' };
-
-    if (!tmpl) {
-      return res.status(200).json(debug === '1' ? { ...basePayload, _debug: { error: 'VDG_URL not set' } } : basePayload);
+    if (!API_KEY) {
+      return res.status(200).json(debug === '1' ? { ...basePayload, _debug:{ error:'VDG_API_KEY not set' } } : basePayload);
     }
 
-    // Build GET URL from template
-    const getUrl = tmpl.includes('{VRM}') ? tmpl.replace('{VRM}', encodeURIComponent(plate)) : tmpl;
-    const debugInfo = { requestGET: maskUrl(getUrl) };
+    // Endpoint from docs
+    const endpoint = `${BASE}/r2/lookup`;
 
-    // ---- 1) Try GET
-    const controller = new AbortController();
-    const to = setTimeout(() => controller.abort(), 10000);
-    let resp = await fetch(getUrl, { method: 'GET', headers: { accept: 'application/json' }, signal: controller.signal });
-    clearTimeout(to);
+    // Build a list of candidate query parameter combos to try (GET)
+    const candidates = [
+      // Official-looking (caps)
+      { apiKey: API_KEY, packageName: PACKAGE, SearchType: 'Registration',   SearchTerm: plate },
+      // lower-case
+      { apiKey: API_KEY, packageName: PACKAGE, searchType: 'Registration',   searchTerm: plate },
+      // Sometimes they call it VRM
+      { apiKey: API_KEY, packageName: PACKAGE, SearchType: 'VRM',            SearchTerm: plate },
+      { apiKey: API_KEY, packageName: PACKAGE, searchType: 'VRM',            searchTerm: plate },
+      // Other synonyms seen in UK data APIs
+      { apiKey: API_KEY, packageName: PACKAGE, SearchType: 'RegistrationNumber', SearchTerm: plate },
+      { apiKey: API_KEY, packageName: PACKAGE, searchType: 'RegistrationNumber', searchTerm: plate }
+    ];
 
-    let raw = await resp.text();
-    debugInfo.statusGET = resp.status;
-    debugInfo.sampleGET = raw.slice(0, 400);
+    const attempts = [];
+    let successJson = null;
 
-    let json = null;
-    try { json = JSON.parse(raw); } catch {}
+    for (const params of candidates) {
+      const u = new URL(endpoint);
+      Object.entries(params).forEach(([k,v]) => u.searchParams.set(k, v));
 
-    const noSearchTerm =
-      json?.responseInformation?.isSuccessStatusCode === false &&
-      /NoSearchTermFound/i.test(json?.responseInformation?.statusMessage || '') ||
-      (json?.requestInformation?.searchTerm == null && json?.requestInformation?.searchType == null);
+      const urlStr = u.toString();
+      const controller = new AbortController();
+      const to = setTimeout(() => controller.abort(), 10000);
+      let status = 0, raw = '', ct = '';
+      let parsed = null, okFlag = false, statusMsg = '';
 
-    // ---- 2) If GET didn’t carry the params, retry as POST JSON
-    if (noSearchTerm) {
-      const u = new URL(getUrl);
-      const apiKey      = u.searchParams.get('apiKey') || u.searchParams.get('apikey') || '';
-      const packageName = u.searchParams.get('packageName') || 'VehicleDetails';
-      const searchType  = u.searchParams.get('SearchType') || u.searchParams.get('searchType') || 'Registration';
-      const postUrl     = `${u.origin}${u.pathname}`;
+      try {
+        const resp = await fetch(urlStr, { method: 'GET', headers: { accept: 'application/json' }, signal: controller.signal });
+        clearTimeout(to);
+        status = resp.status;
+        ct = resp.headers.get('content-type') || '';
+        raw = await resp.text();
 
-      const body = JSON.stringify({
-        apiKey,
-        packageName,
-        searchType,
-        searchTerm: plate
-      });
+        // Try parse json if looks like json
+        if (ct.includes('json') || raw.startsWith('{') || raw.startsWith('[')) {
+          try { parsed = JSON.parse(raw); } catch {}
+        }
 
-      const controller2 = new AbortController();
-      const to2 = setTimeout(() => controller2.abort(), 10000);
-      resp = await fetch(postUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body,
-        signal: controller2.signal
-      });
-      clearTimeout(to2);
+        // Success criteria per their schema
+        okFlag = Boolean(parsed?.responseInformation?.isSuccessStatusCode);
+        statusMsg = parsed?.responseInformation?.statusMessage || '';
 
-      raw = await resp.text();
-      debugInfo.requestPOST = `${postUrl} (JSON body)`;
-      debugInfo.statusPOST = resp.status;
-      debugInfo.samplePOST = raw.slice(0, 400);
+        attempts.push({
+          url: maskUrl(urlStr),
+          status,
+          isJson: Boolean(parsed),
+          isSuccessStatusCode: okFlag,
+          statusMessage: statusMsg,
+          sample: raw.slice(0, 220)
+        });
 
-      try { json = JSON.parse(raw); } catch { json = null; }
+        if (okFlag && parsed?.results) {
+          successJson = parsed;
+          break;
+        }
+      } catch (e) {
+        attempts.push({
+          url: maskUrl(urlStr),
+          status,
+          error: String(e?.message || e),
+          sample: raw.slice(0, 180)
+        });
+      }
     }
 
-    // If we have a JSON with results, map them
-    if (json?.results) {
-      const mapped = buildDisplayPayload(plate, json);
-      return res.status(200).json(debug === '1' ? { ...mapped, _debug: debugInfo } : mapped);
+    if (successJson) {
+      const payload = mapPayload(plate, successJson);
+      return res.status(200).json(debug === '1' ? { ...payload, _debug:{ attempts } } : payload);
     }
 
-    // Fallback – return base payload (non-breaking)
-    return res.status(200).json(debug === '1' ? { ...basePayload, _debug: debugInfo } : basePayload);
-  } catch (e) {
-    // Non-breaking fallback
+    // No variant worked – return non-breaking with debug
+    return res.status(200).json(debug === '1' ? { ...basePayload, _debug:{ attempts } } : basePayload);
+
+  } catch {
     return res.status(200).json({
       vrm: String(req.query?.vrm || '').toUpperCase(),
-      year: '', make: '', model: '', fuelType: '', colour: '', variant: '',
-      note: 'Minimal return due to server error'
+      year:'', make:'', model:'', fuelType:'', colour:'', variant:'',
+      note:'Minimal return due to server error'
     });
   }
 }
