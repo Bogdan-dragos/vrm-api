@@ -1,8 +1,7 @@
 // api/vrm.js
-// Calls VehicleDataGlobal r2/lookup (VehicleDetails package) to fetch VRM info.
-// Requires Vercel env var: 
-//   VDG_URL = https://uk.api.vehicledataglobal.com/r2/lookup?apiKey=...&packageName=VehicleDetails&searchType=Registration&searchTerm={VRM}
-// Test with: /api/vrm?vrm=AB12CDE&debug=1
+// Calls VehicleDataGlobal r2/lookup for VehicleDetails.
+// Uses GET first; if VDG says SearchTerm missing, retries as POST JSON.
+// Env: VDG_URL = full URL template with {VRM} placeholder.
 
 function maskUrl(u) {
   try {
@@ -13,6 +12,28 @@ function maskUrl(u) {
     }
     return url.toString();
   } catch { return '***'; }
+}
+
+function buildDisplayPayload(plate, json) {
+  const payload = { vrm: plate, year: '', make: '', model: '', fuelType: '', colour: '', variant: '' };
+  const r = json?.results || {};
+  const vid = r?.vehicleDetails?.vehicleIdentification || {};
+  const vhist = r?.vehicleDetails?.vehicleHistory || {};
+  const mid = r?.modelDetails?.modelIdentification || {};
+  const pwr = r?.modelDetails?.powertrain || {};
+
+  payload.make   = String(mid?.make  || vid?.dvlaMake || '').trim();
+  payload.model  = String(mid?.model || vid?.dvlaModel || '').trim();
+  payload.variant= String(mid?.modelVariant || '').trim();
+
+  const yom = vid?.yearOfManufacture;
+  const dom = typeof vid?.dateOfManufacture === 'string' ? vid?.dateOfManufacture.slice(0,4) : '';
+  payload.year   = String(yom || dom || '').trim();
+
+  payload.fuelType = String(vid?.dvlaFuelType || pwr?.fuelType || '').trim();
+  payload.colour   = String(vhist?.colourDetails?.currentColour || '').trim();
+
+  return payload;
 }
 
 export default async function handler(req, res) {
@@ -30,85 +51,78 @@ export default async function handler(req, res) {
     const plate = String(vrm).trim().toUpperCase();
     if (!plate) return res.status(400).json({ error: 'Missing vrm' });
 
-    const VDG_URL_TMPL = process.env.VDG_URL || '';
-    const payload = {
-      vrm: plate,
-      year: '',
-      make: '',
-      model: '',
-      fuelType: '',
-      colour: '',
-      variant: ''
-    };
+    const tmpl = process.env.VDG_URL || '';
+    const basePayload = { vrm: plate, year: '', make: '', model: '', fuelType: '', colour: '', variant: '' };
 
-    const debugInfo = { };
-
-    if (!VDG_URL_TMPL) {
-      if (debug === '1') return res.status(200).json({ ...payload, _debug: { error: 'VDG_URL not set' } });
-      return res.status(200).json(payload);
+    if (!tmpl) {
+      return res.status(200).json(debug === '1' ? { ...basePayload, _debug: { error: 'VDG_URL not set' } } : basePayload);
     }
 
-    const url = VDG_URL_TMPL.includes('{VRM}')
-      ? VDG_URL_TMPL.replace('{VRM}', encodeURIComponent(plate))
-      : `${VDG_URL_TMPL}${encodeURIComponent(plate)}`;
+    // Build GET URL from template
+    const getUrl = tmpl.includes('{VRM}') ? tmpl.replace('{VRM}', encodeURIComponent(plate)) : tmpl;
+    const debugInfo = { requestGET: maskUrl(getUrl) };
 
-    try {
-      const controller = new AbortController();
-      const to = setTimeout(() => controller.abort(), 8000);
-      const resp = await fetch(url, { method: 'GET', headers: { accept: 'application/json' }, signal: controller.signal });
-      clearTimeout(to);
+    // ---- 1) Try GET
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), 10000);
+    let resp = await fetch(getUrl, { method: 'GET', headers: { accept: 'application/json' }, signal: controller.signal });
+    clearTimeout(to);
 
-      const raw = await resp.text();
-      debugInfo.request = maskUrl(url);
-      debugInfo.status = resp.status;
-      debugInfo.sample = raw.slice(0, 400);
+    let raw = await resp.text();
+    debugInfo.statusGET = resp.status;
+    debugInfo.sampleGET = raw.slice(0, 400);
 
-      if (!resp.ok) {
-        if (debug === '1') return res.status(200).json({ ...payload, _debug: debugInfo });
-        return res.status(200).json(payload);
-      }
+    let json = null;
+    try { json = JSON.parse(raw); } catch {}
 
-      // The Java model shows this shape:
-      // { requestInformation, responseInformation, billingInformation, results: { vehicleDetails, modelDetails, ... } }
-      let json;
+    const noSearchTerm =
+      json?.responseInformation?.isSuccessStatusCode === false &&
+      /NoSearchTermFound/i.test(json?.responseInformation?.statusMessage || '') ||
+      (json?.requestInformation?.searchTerm == null && json?.requestInformation?.searchType == null);
+
+    // ---- 2) If GET didn’t carry the params, retry as POST JSON
+    if (noSearchTerm) {
+      const u = new URL(getUrl);
+      const apiKey      = u.searchParams.get('apiKey') || u.searchParams.get('apikey') || '';
+      const packageName = u.searchParams.get('packageName') || 'VehicleDetails';
+      const searchType  = u.searchParams.get('SearchType') || u.searchParams.get('searchType') || 'Registration';
+      const postUrl     = `${u.origin}${u.pathname}`;
+
+      const body = JSON.stringify({
+        apiKey,
+        packageName,
+        searchType,
+        searchTerm: plate
+      });
+
+      const controller2 = new AbortController();
+      const to2 = setTimeout(() => controller2.abort(), 10000);
+      resp = await fetch(postUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body,
+        signal: controller2.signal
+      });
+      clearTimeout(to2);
+
+      raw = await resp.text();
+      debugInfo.requestPOST = `${postUrl} (JSON body)`;
+      debugInfo.statusPOST = resp.status;
+      debugInfo.samplePOST = raw.slice(0, 400);
+
       try { json = JSON.parse(raw); } catch { json = null; }
-
-      const r = json?.results || {};
-      const vehicleIdentification = r?.vehicleDetails?.vehicleIdentification || {};
-      const vehicleHistory = r?.vehicleDetails?.vehicleHistory || {};
-      const modelIdentification = r?.modelDetails?.modelIdentification || {};
-      const powertrain = r?.modelDetails?.powertrain || {};
-      const evDetails = powertrain?.evDetails || {};
-
-      // Map fields
-      payload.make =
-        (modelIdentification?.make || vehicleIdentification?.dvlaMake || '').toString().trim();
-      payload.model =
-        (modelIdentification?.model || vehicleIdentification?.dvlaModel || '').toString().trim();
-      payload.variant =
-        (modelIdentification?.modelVariant || '').toString().trim();
-
-      // Year: prefer DVLA yearOfManufacture
-      payload.year = String(
-        vehicleIdentification?.yearOfManufacture ||
-        vehicleIdentification?.dateOfManufacture?.split?.('T')?.[0]?.slice(0,4) ||
-        ''
-      );
-
-      payload.fuelType =
-        (vehicleIdentification?.dvlaFuelType || powertrain?.fuelType || '').toString().trim();
-
-      payload.colour =
-        (vehicleHistory?.colourDetails?.currentColour || '').toString().trim();
-
-      if (debug === '1') return res.status(200).json({ ...payload, _debug: debugInfo });
-      return res.status(200).json(payload);
-    } catch (e) {
-      debugInfo.fetchError = String(e?.message || e);
-      if (debug === '1') return res.status(200).json({ ...payload, _debug: debugInfo });
-      return res.status(200).json(payload);
     }
-  } catch (err) {
+
+    // If we have a JSON with results, map them
+    if (json?.results) {
+      const mapped = buildDisplayPayload(plate, json);
+      return res.status(200).json(debug === '1' ? { ...mapped, _debug: debugInfo } : mapped);
+    }
+
+    // Fallback – return base payload (non-breaking)
+    return res.status(200).json(debug === '1' ? { ...basePayload, _debug: debugInfo } : basePayload);
+  } catch (e) {
+    // Non-breaking fallback
     return res.status(200).json({
       vrm: String(req.query?.vrm || '').toUpperCase(),
       year: '', make: '', model: '', fuelType: '', colour: '', variant: '',
