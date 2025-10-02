@@ -1,7 +1,5 @@
 // api/vrm.js
-// VehicleDataGlobal (VDG) VehicleDetails lookup.
-// IMPORTANT: VDG expects a POST with JSON body (not GET).
-// Requires Vercel env: VDG_API_KEY
+// VDG POST version (fix for 405)
 
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -20,68 +18,54 @@ export default async function handler(req, res) {
 
     const endpoint = 'https://uk.api.vehicledataglobal.com/r2/lookup';
     const body = {
-      apiKey: process.env.VDG_API_KEY,
+      apiKey: process.env.VDG_API_KEY,   // <-- must be in Vercel Env
       packageName: 'VehicleDetails',
-      searchType: 'Registration',
-      searchTerm: plate
+      searchType: 'Registration',       // required
+      searchTerm: plate                 // your VRM
     };
 
-    // ---- Call VDG (POST, JSON)
     const resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(body)
+      method: 'POST',                   // POST is required
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(body)        // THIS is the key bit
     });
 
     const raw = await resp.text();
     let data = null;
-    try { data = JSON.parse(raw); } catch { /* leave null */ }
+    try { data = JSON.parse(raw); } catch {}
 
-    // Debug view so we can see exactly what VDG returned
     if (debug) {
       return res.status(200).json({
         vrm: plate,
         status: resp.status,
-        isJson: data !== null,
-        vdgStatusCode: data?.responseInformation?.statusCode,
-        vdgStatusMessage: data?.responseInformation?.statusMessage,
-        isSuccessStatusCode: data?.responseInformation?.isSuccessStatusCode,
+        bodySent: body,
         sample: raw.slice(0, 800)
       });
     }
 
-    // Success check per VDG schema
-    if (!resp.ok || !data?.responseInformation?.isSuccessStatusCode || !data?.results) {
+    if (!resp.ok || !data?.results) {
       return res.status(200).json({ vrm: plate, error: 'Lookup failed' });
     }
 
-    // Map fields from VehicleDetails / ModelDetails
-    const r    = data.results || {};
-    const vid  = r?.vehicleDetails?.vehicleIdentification || {};
-    const vhist= r?.vehicleDetails?.vehicleHistory || {};
-    const mid  = r?.modelDetails?.modelIdentification || {};
-    const pwr  = r?.modelDetails?.powertrain || {};
-
-    const year =
-      vid?.yearOfManufacture ||
-      (typeof vid?.dateOfManufacture === 'string' ? vid.dateOfManufacture.slice(0,4) : '');
+    const vid = data.results?.vehicleDetails?.vehicleIdentification || {};
+    const mid = data.results?.modelDetails?.modelIdentification || {};
+    const vhist = data.results?.vehicleDetails?.vehicleHistory || {};
+    const pwr = data.results?.modelDetails?.powertrain || {};
 
     return res.status(200).json({
       vrm: plate,
-      year: String(year || '').trim(),
-      make: String(mid?.make  || vid?.dvlaMake  || '').trim(),
-      model:String(mid?.model || vid?.dvlaModel || '').trim(),
-      fuelType: String(vid?.dvlaFuelType || pwr?.fuelType || '').trim(),
-      colour: String(vhist?.colourDetails?.currentColour || '').trim(),
-      variant: String(mid?.modelVariant || '').trim()
+      year: vid.yearOfManufacture || '',
+      make: mid.make || vid.dvlaMake || '',
+      model: mid.model || vid.dvlaModel || '',
+      fuelType: vid.dvlaFuelType || pwr.fuelType || '',
+      colour: vhist?.colourDetails?.currentColour || '',
+      variant: mid.modelVariant || ''
     });
 
-  } catch {
-    // Non-breaking fallback
-    return res.status(200).json({
-      vrm: String(req.query?.vrm || '').toUpperCase(),
-      year:'', make:'', model:'', fuelType:'', colour:'', variant:'',
-      note:'Minimal return due to server error'
-    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 }
