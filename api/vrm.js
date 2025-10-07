@@ -1,6 +1,6 @@
 // /api/vrm.js
-// Returns: { vrm, year, make, model, fuelType, colour, variant, description, ... }
-// Uses DVSA + DVLA like before, and adds CAP HPI VRMValuation (CAPDer = variant).
+// Combines DVSA, DVLA, and Vehicle Data Global (VDG)
+// Returns: { vrm, year, make, model, variant, fuelType, colour, description }
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -10,8 +10,8 @@ export default async function handler(req, res) {
   if (!vrm) return res.status(400).json({ error: "Missing vrm param ?vrm=AB12CDE" });
 
   const out = {
-    vrm, year: "", make: "", model: "", fuelType: "", colour: "",
-    variant: "", description: "", calls: {}
+    vrm, year: "", make: "", model: "", variant: "",
+    fuelType: "", colour: "", description: "", calls: {}
   };
 
   // ---------------- DVSA (token + vehicle) ----------------
@@ -81,58 +81,26 @@ export default async function handler(req, res) {
     out.calls.dvlaError = e.message;
   }
 
-  // ---------------- CAP HPI VRMValuation (to get DERIVATIVE/VARIANT) ----------------
-  // Docs list VRMValuation here and show CAPMan/CAPRange/CAPMod/CAPDer in the response. 
-  // https://soap.cap.co.uk/vrm/capvrm.asmx/VRMValuation (SOAP).  [oai_citation:2‡developer.cap.co.uk](https://developer.cap.co.uk/webservices)
+  // ---------------- Vehicle Data Global (VDG) for Variant ----------------
+  try {
+    const vdgUrl = `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&apikey=${encodeURIComponent(process.env.VDG_API_KEY)}&vrm=${encodeURIComponent(vrm)}`;
+    const r = await fetch(vdgUrl, { method: "GET" });
+    if (debug) out.calls.vdg = { status: r.status };
+    const j = await r.json().catch(() => null);
 
-  if (process.env.CAP_SUBSCRIBER_ID && process.env.CAP_PASSWORD) {
-    try {
-      const soapUrl = "https://soap.cap.co.uk/vrm/capvrm.asmx/VRMValuation";
-      const ns = "https://soap.cap.co.uk/vrm";
-      const body = `<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <VRMValuation xmlns="${ns}">
-      <SubscriberID>${escapeXml(process.env.CAP_SUBSCRIBER_ID)}</SubscriberID>
-      <Password>${escapeXml(process.env.CAP_PASSWORD)}</Password>
-      <VRM>${escapeXml(vrm)}</VRM>
-      <Mileage>0</Mileage>
-      <StandardEquipmentRequired>false</StandardEquipmentRequired>
-    </VRMValuation>
-  </soap:Body>
-</soap:Envelope>`;
+    if (r.ok && j) {
+      // Some APIs wrap data inside `data` or similar fields
+      const data = j.data || j;
 
-      const resp = await fetch(soapUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/xml; charset=utf-8",
-          "SOAPAction": `${ns}/VRMValuation`
-        },
-        body
-      });
-
-      const xml = await resp.text();
-      if (debug) out.calls.cap = { status: resp.status };
-
-      if (resp.ok) {
-        // naive XML pulls (enough for these tags)
-        const capMan = tag(xml, "CAPMan");
-        const capMod = tag(xml, "CAPMod");
-        const capDer = tag(xml, "CAPDer");
-        // prefer CAP's make/model if absent
-        out.make   = out.make  || capMan || "";
-        out.model  = out.model || capMod || "";
-        out.variant = capDer || out.variant || "";
-      } else {
-        out.calls.capError = `HTTP ${resp.status}`;
-      }
-    } catch (e) {
-      out.calls.capError = e.message;
+      out.make    = data.Make   || out.make;
+      out.model   = data.Model  || out.model;
+      out.variant = data.Variant || data.Derivative || data.Trim || out.variant;
+      out.year    = data.YearOfManufacture || out.year;
+      out.fuelType = data.FuelType || out.fuelType;
+      out.colour   = data.Colour || out.colour;
     }
-  } else {
-    out.calls.capSkipped = "No CAP_SUBSCRIBER_ID/CAP_PASSWORD";
+  } catch (e) {
+    out.calls.vdgError = e.message;
   }
 
   // ---------------- Build a nice description ----------------
@@ -140,19 +108,4 @@ export default async function handler(req, res) {
     .filter(Boolean).join(" ");
 
   return res.status(200).json(out);
-}
-
-// --- tiny XML extractor (no dependency) ---
-function tag(xml, name) {
-  const re = new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`, "i");
-  const m = xml.match(re);
-  return m ? m[1].trim() : "";
-}
-function escapeXml(s) {
-  return String(s)
-    .replace(/&/g,"&amp;")
-    .replace(/</g,"&lt;")
-    .replace(/>/g,"&gt;")
-    .replace(/"/g,"&quot;")
-    .replace(/'/g,"&apos;");
 }
