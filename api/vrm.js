@@ -3,7 +3,7 @@
 // Returns: { vrm, year, make, model, variant, fuelType, colour, description }
 
 export default async function handler(req, res) {
-  // Basic CORS
+  // CORS (incl. preflight)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With");
@@ -11,43 +11,18 @@ export default async function handler(req, res) {
 
   const vrm = String(req.query.vrm || "").trim().toUpperCase();
   const debug = String(req.query.debug || "") === "1";
-
-  if (!vrm) {
-    return res.status(400).json({ error: "Missing vrm param ?vrm=AB12CDE" });
-  }
+  if (!vrm) return res.status(400).json({ error: "Missing vrm param ?vrm=AB12CDE" });
 
   const out = {
-    vrm,
-    year: "",
-    make: "",
-    model: "",
-    variant: "",
-    fuelType: "",
-    colour: "",
-    description: "",
-    calls: {}
+    vrm, year: "", make: "", model: "", variant: "",
+    fuelType: "", colour: "", description: "", calls: {}
   };
 
-  // --- helpers ---
+  // helper to set only if empty
   const setIfEmpty = (key, val) => {
-    if (val !== undefined && val !== null && val !== "" && (out[key] === "" || out[key] === undefined || out[key] === null)) {
+    if (val === undefined || val === null || val === "") return;
+    if (out[key] === "" || out[key] === undefined || out[key] === null) {
       out[key] = typeof val === "number" ? String(val) : String(val);
-    }
-  };
-
-  const safeJson = async (r) => {
-    // only attempt JSON if content-type looks like JSON
-    const ctype = r.headers.get("content-type") || "";
-    if (!ctype.toLowerCase().includes("application/json")) {
-      const txt = await r.text();
-      return { __nonJsonText: txt };
-    }
-    try {
-      return await r.json();
-    } catch {
-      // fallback: try text for debugging
-      const txt = await r.text();
-      return { __badJsonText: txt };
     }
   };
 
@@ -64,7 +39,7 @@ export default async function handler(req, res) {
         grant_type: "client_credentials",
       }),
     });
-    const tj = await safeJson(t);
+    const tj = await t.json().catch(() => ({}));
     if (!t.ok) throw new Error(`DVSA token ${t.status}`);
     token = tj.access_token || "";
     if (debug) out.calls.dvsaToken = { status: t.status, ok: t.ok };
@@ -82,9 +57,9 @@ export default async function handler(req, res) {
           "Accept": "application/json"
         }
       });
-      const j = await safeJson(r);
+      const j = await r.json().catch(() => ({}));
       if (debug) out.calls.dvsaVehicle = { status: r.status, ok: r.ok };
-      if (r.ok && j && typeof j === "object") {
+      if (r.ok && j) {
         setIfEmpty("make", j.make);
         setIfEmpty("model", j.model);
         setIfEmpty("fuelType", j.fuelType);
@@ -106,9 +81,9 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({ registrationNumber: vrm })
     });
-    const j = await safeJson(r);
+    const j = await r.json().catch(() => ({}));
     if (debug) out.calls.dvla = { status: r.status, ok: r.ok };
-    if (r.ok && j && typeof j === "object") {
+    if (r.ok && j) {
       setIfEmpty("year", j.yearOfManufacture);
       setIfEmpty("make", j.make);
       setIfEmpty("colour", j.colour);
@@ -118,7 +93,7 @@ export default async function handler(req, res) {
     out.calls.dvlaError = String(e?.message || e);
   }
 
-  // ---------------- Vehicle Data Global (VDG) - unified parser with diagnostics ----------------
+  // ---------------- VDG (nested + flat) with safe diagnostics ----------------
   try {
     const vdgUrl = `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&apikey=${encodeURIComponent(process.env.VDG_API_KEY)}&vrm=${encodeURIComponent(vrm)}`;
     if (debug) {
@@ -130,68 +105,63 @@ export default async function handler(req, res) {
     const r = await fetch(vdgUrl, { method: "GET", headers: { "Accept": "application/json" } });
     if (debug) out.calls.vdg = { status: r.status, ok: r.ok };
 
-    // capture raw preview for debugging (even on non-2xx)
-    const raw = await r.text();
+    const raw = await r.text(); // capture regardless of status
     if (debug) out.calls.vdgBodyPreview = raw.slice(0, 600);
 
-    // if not OK, stop here (DVSA/DVLA data already present)
-    if (!r.ok) {
-      if (r.status === 404 && debug) out.calls.vdgNotFound = true;
-    } else {
-      // parse JSON from the raw (since we've already consumed the body)
-      let j = null;
-      try { j = JSON.parse(raw); } catch { j = { __badJsonText: raw }; }
+    if (r.ok) {
+      let j = {};
+      try { j = JSON.parse(raw); } catch { j = {}; }
 
-      if (j && typeof j === "object") {
-        let usedNested = false;
+      let usedNested = false;
 
-        // --- Prefer nested schema ---
-        if (j.Results && typeof j.Results === "object") {
-          const Results = j.Results || {};
-          const VD = Results.VehicleDetails || {};
-          const VI = VD.VehicleIdentification || {};
-          const VH = Results.VehicleHistory || {};
-          const MD = Results.ModelDetails || {};
-          const MI = MD.ModelIdentification || {};
+      // Prefer nested schema (Results…)
+      if (j && j.Results) {
+        const Results = j.Results || {};
+        const VD = Results.VehicleDetails || {};
+        const VI = VD.VehicleIdentification || {};
+        const VH = Results.VehicleHistory || {};
+        const MD = Results.ModelDetails || {};
+        const MI = MD.ModelIdentification || {};
 
-          const vdgMake   = VI.DvlaMake || MI.Make;
-          const vdgModel  = VI.DvlaModel || MI.Model || MI.Range;
-          const vdgVar    = MI.ModelVariant || MI.Series || "";
-          const vdgFuel   = VI.DvlaFuelType;
-          const vdgColour = VH?.ColourDetails?.CurrentColour || "";
-          const vdgYear   = (VI.YearOfManufacture !== undefined && VI.YearOfManufacture !== null)
-            ? String(VI.YearOfManufacture)
-            : "";
+        const vdgMake   = VI.DvlaMake || MI.Make;
+        const vdgModel  = VI.DvlaModel || MI.Model || MI.Range;
+        const vdgVar    = MI.ModelVariant || MI.Series || "";
+        const vdgFuel   = VI.DvlaFuelType;
+        const vdgColour = VH?.ColourDetails?.CurrentColour || "";
+        const vdgYear   = (VI.YearOfManufacture !== undefined && VI.YearOfManufacture !== null)
+          ? String(VI.YearOfManufacture)
+          : "";
 
-          setIfEmpty("make", vdgMake);
-          setIfEmpty("model", vdgModel);
-          setIfEmpty("variant", vdgVar);
-          setIfEmpty("fuelType", vdgFuel);
-          setIfEmpty("colour", vdgColour);
-          setIfEmpty("year", vdgYear);
+        setIfEmpty("make", vdgMake);
+        setIfEmpty("model", vdgModel);
+        setIfEmpty("variant", vdgVar);
+        setIfEmpty("fuelType", vdgFuel);
+        setIfEmpty("colour", vdgColour);
+        setIfEmpty("year", vdgYear);
 
-          // Derive variant from compound DVLA model string if needed
-          if (!out.variant && out.model && VI.DvlaModel && MI.Range) {
-            const tail = String(VI.DvlaModel).replace(new RegExp(`^${MI.Range}\\s*`, "i"), "").trim();
-            if (tail && tail !== VI.DvlaModel) setIfEmpty("variant", tail);
-          }
-
-          usedNested = true;
-          if (debug) out.calls.vdgSource = "nested";
+        // Derive variant from compound DVLA model when possible
+        if (!out.variant && out.model && VI.DvlaModel && MI.Range) {
+          const tail = String(VI.DvlaModel).replace(new RegExp(`^${MI.Range}\\s*`, "i"), "").trim();
+          if (tail && tail !== VI.DvlaModel) setIfEmpty("variant", tail);
         }
 
-        // --- Fallback: flat / data schema ---
-        const data = j.data || j;
-        if (!usedNested && data && typeof data === "object") {
-          setIfEmpty("make", data.Make);
-          setIfEmpty("model", data.Model);
-          setIfEmpty("variant", data.Variant || data.Derivative || data.Trim);
-          setIfEmpty("year", data.YearOfManufacture);
-          setIfEmpty("fuelType", data.FuelType);
-          setIfEmpty("colour", data.Colour);
-          if (debug) out.calls.vdgSource = "flat";
-        }
+        usedNested = true;
+        if (debug) out.calls.vdgSource = "nested";
       }
+
+      // Fallback to flat/data schema
+      const data = j?.data || j;
+      if (!usedNested && data && typeof data === "object") {
+        setIfEmpty("make", data.Make);
+        setIfEmpty("model", data.Model);
+        setIfEmpty("variant", data.Variant || data.Derivative || data.Trim);
+        setIfEmpty("year", data.YearOfManufacture);
+        setIfEmpty("fuelType", data.FuelType);
+        setIfEmpty("colour", data.Colour);
+        if (debug) out.calls.vdgSource = "flat";
+      }
+    } else {
+      if (r.status === 404 && debug) out.calls.vdgNotFound = true;
     }
   } catch (e) {
     out.calls.vdgError = String(e?.message || e);
