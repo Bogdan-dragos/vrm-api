@@ -88,17 +88,33 @@ export default async function handler(req, res) {
     out.calls.dvlaError = e.message;
   }
 
-  // ---------------- Vehicle Data Global (VDG) - unified parser ----------------
-  try {
-    const vdgUrl = `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&apikey=${encodeURIComponent(process.env.VDG_API_KEY)}&vrm=${encodeURIComponent(vrm)}`;
-    const r = await fetch(vdgUrl, { method: "GET", headers: { "Accept": "application/json" } });
-    if (debug) out.calls.vdg = { status: r.status, ok: r.ok };
+  // ---------------- Vehicle Data Global (VDG) - unified parser with strong diagnostics ----------------
+try {
+  const vdgUrl = `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&apikey=${encodeURIComponent(process.env.VDG_API_KEY)}&vrm=${encodeURIComponent(vrm)}`;
 
-    const j = await r.json().catch(() => null);
-    if (r.ok && j) {
+  // record a redacted request for debugging
+  out.calls.vdgRequest = {
+    url: `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&vrm=${encodeURIComponent(vrm)}&apikey=***`
+  };
+
+  const r = await fetch(vdgUrl, { method: "GET", headers: { "Accept": "application/json" } });
+  if (debug) out.calls.vdg = { status: r.status, ok: r.ok };
+
+  const raw = await r.text();
+  if (debug) out.calls.vdgBodyPreview = raw.slice(0, 400);
+
+  // Handle non-2xx early so you can see what's going on
+  if (!r.ok) {
+    if (r.status === 404) out.calls.vdgNotFound = true;   // helpful flag for cherished plates
+    // nothing else to do; DVSA/DVLA data already set above
+  } else {
+    let j = null;
+    try { j = JSON.parse(raw); } catch (_) { /* ignore */ }
+
+    if (j) {
       let usedNested = false;
 
-      // --- Prefer the rich nested schema if present ---
+      // Prefer rich nested schema
       if (j.Results) {
         const Results = j.Results || {};
         const VD = Results.VehicleDetails || {};
@@ -121,7 +137,6 @@ export default async function handler(req, res) {
         out.colour   = out.colour   || (vdgColour || "");
         out.year     = out.year     || (vdgYear   || "");
 
-        // If variant is still empty, try to derive it from a compound DVLA model string.
         if (!out.variant && out.model && VI.DvlaModel && MI.Range) {
           const tail = VI.DvlaModel.replace(new RegExp(`^${MI.Range}\\s*`, "i"), "").trim();
           if (tail && tail !== VI.DvlaModel) out.variant = tail;
@@ -131,7 +146,7 @@ export default async function handler(req, res) {
         if (debug) out.calls.vdgSource = "nested";
       }
 
-      // --- Fallback to older flat/data schema to fill any remaining blanks ---
+      // Fallback to older flat/data shape
       const data = j.data || j;
       if (data && typeof data === "object") {
         out.make     = out.make     || data.Make;
@@ -144,13 +159,7 @@ export default async function handler(req, res) {
         if (debug && !usedNested) out.calls.vdgSource = "flat";
       }
     }
-  } catch (e) {
-    out.calls.vdgError = e.message;
   }
-
-  // ---------------- Build a nice description ----------------
-  out.description = [out.year, out.make, out.model, out.variant, out.fuelType]
-    .filter(Boolean).join(" ");
-
-  return res.status(200).json(out);
+} catch (e) {
+  out.calls.vdgError = e.message;
 }
