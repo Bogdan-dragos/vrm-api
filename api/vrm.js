@@ -10,8 +10,15 @@ export default async function handler(req, res) {
   if (!vrm) return res.status(400).json({ error: "Missing vrm param ?vrm=AB12CDE" });
 
   const out = {
-    vrm, year: "", make: "", model: "", variant: "",
-    fuelType: "", colour: "", description: "", calls: {}
+    vrm,
+    year: "",
+    make: "",
+    model: "",
+    variant: "",
+    fuelType: "",
+    colour: "",
+    description: "",
+    calls: {}
   };
 
   // ---------------- DVSA (token + vehicle) ----------------
@@ -45,7 +52,7 @@ export default async function handler(req, res) {
           "Accept": "application/json"
         }
       });
-      const j = await r.json().catch(()=>null);
+      const j = await r.json().catch(() => null);
       if (debug) out.calls.dvsaVehicle = { status: r.status };
       if (r.ok && j) {
         out.make     = j.make     || out.make;
@@ -73,31 +80,69 @@ export default async function handler(req, res) {
     if (debug) out.calls.dvla = { status: r.status };
     if (r.ok && j) {
       out.year     = String(j.yearOfManufacture || out.year || "");
-      out.make     = j.make   || out.make;
-      out.colour   = j.colour || out.colour;
+      out.make     = j.make     || out.make;
+      out.colour   = j.colour   || out.colour;
       out.fuelType = j.fuelType || out.fuelType;
     }
   } catch (e) {
     out.calls.dvlaError = e.message;
   }
 
-  // ---------------- Vehicle Data Global (VDG) for Variant ----------------
+  // ---------------- Vehicle Data Global (VDG) - unified parser ----------------
   try {
     const vdgUrl = `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&apikey=${encodeURIComponent(process.env.VDG_API_KEY)}&vrm=${encodeURIComponent(vrm)}`;
-    const r = await fetch(vdgUrl, { method: "GET" });
-    if (debug) out.calls.vdg = { status: r.status };
+    const r = await fetch(vdgUrl, { method: "GET", headers: { "Accept": "application/json" } });
+    if (debug) out.calls.vdg = { status: r.status, ok: r.ok };
+
     const j = await r.json().catch(() => null);
-
     if (r.ok && j) {
-      // Some APIs wrap data inside `data` or similar fields
-      const data = j.data || j;
+      let usedNested = false;
 
-      out.make    = data.Make   || out.make;
-      out.model   = data.Model  || out.model;
-      out.variant = data.Variant || data.Derivative || data.Trim || out.variant;
-      out.year    = data.YearOfManufacture || out.year;
-      out.fuelType = data.FuelType || out.fuelType;
-      out.colour   = data.Colour || out.colour;
+      // --- Prefer the rich nested schema if present ---
+      if (j.Results) {
+        const Results = j.Results || {};
+        const VD = Results.VehicleDetails || {};
+        const VI = VD.VehicleIdentification || {};
+        const VH = Results.VehicleHistory || {};
+        const MD = Results.ModelDetails || {};
+        const MI = MD.ModelIdentification || {};
+
+        const vdgMake   = VI.DvlaMake || MI.Make;
+        const vdgModel  = VI.DvlaModel || MI.Model || MI.Range;
+        const vdgVar    = MI.ModelVariant || MI.Series || "";
+        const vdgFuel   = VI.DvlaFuelType;
+        const vdgColour = (VH.ColourDetails && VH.ColourDetails.CurrentColour) || "";
+        const vdgYear   = typeof VI.YearOfManufacture !== "undefined" ? String(VI.YearOfManufacture) : "";
+
+        out.make     = out.make     || (vdgMake   || "");
+        out.model    = out.model    || (vdgModel  || "");
+        out.variant  = out.variant  || (vdgVar    || "");
+        out.fuelType = out.fuelType || (vdgFuel   || "");
+        out.colour   = out.colour   || (vdgColour || "");
+        out.year     = out.year     || (vdgYear   || "");
+
+        // If variant is still empty, try to derive it from a compound DVLA model string.
+        if (!out.variant && out.model && VI.DvlaModel && MI.Range) {
+          const tail = VI.DvlaModel.replace(new RegExp(`^${MI.Range}\\s*`, "i"), "").trim();
+          if (tail && tail !== VI.DvlaModel) out.variant = tail;
+        }
+
+        usedNested = true;
+        if (debug) out.calls.vdgSource = "nested";
+      }
+
+      // --- Fallback to older flat/data schema to fill any remaining blanks ---
+      const data = j.data || j;
+      if (data && typeof data === "object") {
+        out.make     = out.make     || data.Make;
+        out.model    = out.model    || data.Model;
+        out.variant  = out.variant  || data.Variant || data.Derivative || data.Trim;
+        out.year     = out.year     || (data.YearOfManufacture ? String(data.YearOfManufacture) : "");
+        out.fuelType = out.fuelType || data.FuelType;
+        out.colour   = out.colour   || data.Colour;
+
+        if (debug && !usedNested) out.calls.vdgSource = "flat";
+      }
     }
   } catch (e) {
     out.calls.vdgError = e.message;
