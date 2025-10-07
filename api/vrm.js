@@ -18,12 +18,9 @@ export default async function handler(req, res) {
     fuelType: "", colour: "", description: "", calls: {}
   };
 
-  // helper to set only if empty
   const setIfEmpty = (key, val) => {
     if (val === undefined || val === null || val === "") return;
-    if (out[key] === "" || out[key] === undefined || out[key] === null) {
-      out[key] = typeof val === "number" ? String(val) : String(val);
-    }
+    if (out[key] === "" || out[key] == null) out[key] = typeof val === "number" ? String(val) : String(val);
   };
 
   // ---------------- DVSA (token + vehicle) ----------------
@@ -95,10 +92,12 @@ export default async function handler(req, res) {
 
   // ---------------- VDG (nested + flat) with safe diagnostics ----------------
   try {
-    const vdgUrl = `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&apikey=${encodeURIComponent(process.env.VDG_API_KEY)}&vrm=${encodeURIComponent(vrm)}`;
+    const vdgBase = (process.env.VDG_BASE || "https://uk.api.vehicledataglobal.com").replace(/\/+$/, "");
+    const vdgUrl = `${vdgBase}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE || "VehicleDetails")}&apikey=${encodeURIComponent(process.env.VDG_API_KEY || "")}&vrm=${encodeURIComponent(vrm)}`;
+
     if (debug) {
       out.calls.vdgRequest = {
-        url: `${process.env.VDG_BASE}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE)}&vrm=${encodeURIComponent(vrm)}&apikey=***`
+        url: `${vdgBase}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE || "VehicleDetails")}&vrm=${encodeURIComponent(vrm)}&apikey=***`
       };
     }
 
@@ -169,8 +168,7 @@ export default async function handler(req, res) {
 
   // ---------------- Build a nice description ----------------
   out.description = [out.year, out.make, out.model, out.variant, out.fuelType]
-    .filter(Boolean)
-    .join(" ");
+    .filter(Boolean).join(" ");
 
   return res.status(200).json(out);
 }
