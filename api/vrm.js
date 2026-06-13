@@ -1,20 +1,21 @@
 // /api/vrm.js
-// Partsworth VRM lookup: DVSA (MOT) + DVLA (VES) + VDG combiner.
+// Partsworth VRM lookup. VDG-only (DVSA + DVLA disabled by default).
 // Returns the customer's vehicle profile for the chat agent's lookup_vehicle tool.
 //
 // Usage:
-//   /api/vrm?vrm=OV17ANR
-//   /api/vrm?vrm=OV17ANR&debug=1            -> include call statuses
-//   /api/vrm?vrm=OV17ANR&debug=2            -> ALSO dump the full VDG Results object
-//   /api/vrm?vrm=OV17ANR&sources=vdg        -> only hit VDG
-//   /api/vrm?vrm=OV17ANR&sources=none       -> self-test, no external calls
+//   /api/vrm?vrm=E4BOG
+//   /api/vrm?vrm=E4BOG&debug=1            -> include call statuses
+//   /api/vrm?vrm=E4BOG&debug=2            -> ALSO dump the full VDG Results object
+//   /api/vrm?vrm=E4BOG&sources=dvsa,dvla,vdg  -> re-enable the others if ever needed
+//   /api/vrm?vrm=E4BOG&sources=none       -> self-test, no external calls
 //
-// Env required: DVSA_CLIENT_ID, DVSA_CLIENT_SECRET, DVSA_API_KEY, DVSA_SCOPE_URL,
-//               DVSA_TOKEN_URL, DVLA_API_KEY, VDG_BASE, VDG_PACKAGE, VDG_API_KEY
+// Each VDG lookup is charged (~£0.15). The warm cache below avoids paying twice
+// for the same reg within an hour while the serverless instance stays warm.
+//
+// Env required: VDG_BASE, VDG_PACKAGE, VDG_API_KEY
 // Env optional: ALLOWED_ORIGINS (comma-separated list of your own domains)
+//               DVSA_* and DVLA_API_KEY only needed if you re-enable those sources.
 
-// Best-effort warm cache. Survives only while the serverless instance is warm.
-// For reliable caching across instances, move this to Upstash Redis.
 const CACHE = new Map();
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
 
@@ -39,7 +40,8 @@ export default async function handler(req, res) {
     const debug = String(req.query.debug || "");
     const debug1 = debug === "1" || debug === "2";
     const debug2 = debug === "2";
-    const sourcesParam = String(req.query.sources || "dvsa,dvla,vdg").toLowerCase();
+    // DVSA + DVLA are OFF by default now. VDG only.
+    const sourcesParam = String(req.query.sources || "vdg").toLowerCase();
     const useDVSA = sourcesParam.includes("dvsa");
     const useDVLA = sourcesParam.includes("dvla");
     const useVDG  = sourcesParam.includes("vdg");
@@ -47,8 +49,7 @@ export default async function handler(req, res) {
 
     if (!vrm) return res.status(400).json({ error: "Missing vrm param ?vrm=AB12CDE" });
 
-    // ---------- cheap plate validation: reject junk before spending an API call ----------
-    const VRM_RE = /^[A-Z0-9]{2,8}$/; // permissive; covers current, prefix, suffix and dateless
+    const VRM_RE = /^[A-Z0-9]{2,8}$/;
     if (!skipAll && !VRM_RE.test(vrm)) {
       return res.status(400).json({ error: "That doesn't look like a UK registration." });
     }
@@ -64,9 +65,11 @@ export default async function handler(req, res) {
       vrm,
       year: "", make: "", model: "", variant: "",
       variantDerived: "", dvlaModel: "",
-      // fitment-critical fields the chat agent's scoring needs:
-      engineSize: "", engineCode: "", transmission: "", bodyType: "",
-      drivetrain: "", chassis: "",
+      // fitment-critical fields for the chat agent's scoring:
+      engineSize: "", engineCode: "", engineDescription: "",
+      transmission: "", gears: "", bodyType: "", doors: "",
+      drivetrain: "", chassis: "", platform: "", platformShared: "",
+      yearStart: "", yearEnd: "", yearRange: "",
       fuelType: "", colour: "", description: "",
       calls: { sources: sourcesParam }
     };
@@ -74,16 +77,22 @@ export default async function handler(req, res) {
     // ---------- helpers ----------
     const setIfEmpty = (key, val) => {
       if (val === undefined || val === null || val === "") return;
-      if (!out[key]) out[key] = typeof val === "number" ? String(val) : String(val);
+      if (!out[key]) out[key] = (typeof val === "number" || typeof val === "boolean") ? String(val) : String(val);
     };
 
-    // first non-empty value from a list of candidate getter functions (never throws)
+    // first non-empty value from candidate getter functions (never throws)
     const pick = (...fns) => {
       for (const fn of fns) {
         try { const v = fn(); if (v !== undefined && v !== null && v !== "") return v; }
         catch { /* keep trying */ }
       }
       return "";
+    };
+
+    const yearOf = (iso) => {
+      const s = String(iso || "");
+      const m = s.match(/^(\d{4})/);
+      return m ? m[1] : "";
     };
 
     async function fetchWithTimeout(url, opt = {}, ms = 8000) {
@@ -104,26 +113,19 @@ export default async function handler(req, res) {
 
     if (debug1) {
       out.calls.env = {
-        DVSA_CLIENT_ID: !!process.env.DVSA_CLIENT_ID,
-        DVSA_CLIENT_SECRET: !!process.env.DVSA_CLIENT_SECRET,
-        DVSA_API_KEY: !!process.env.DVSA_API_KEY,
-        DVSA_SCOPE_URL: !!process.env.DVSA_SCOPE_URL,
-        DVSA_TOKEN_URL: !!process.env.DVSA_TOKEN_URL,
-        DVLA_API_KEY: !!process.env.DVLA_API_KEY,
         VDG_BASE: !!process.env.VDG_BASE,
         VDG_PACKAGE: !!process.env.VDG_PACKAGE,
         VDG_API_KEY: !!process.env.VDG_API_KEY,
       };
     }
 
-    // ---------- self-test: no external calls ----------
     if (skipAll) {
       out.description = [out.year, out.make, out.model, out.variant || out.variantDerived, out.fuelType]
         .filter(Boolean).join(" ");
       return res.status(200).json(out);
     }
 
-    // ---------- DVSA (token + vehicle) ----------
+    // ---------- DVSA (disabled by default; behind flag) ----------
     if (useDVSA) {
       let token = "";
       const tokenRes = await fetchWithTimeout(process.env.DVSA_TOKEN_URL, {
@@ -138,15 +140,10 @@ export default async function handler(req, res) {
       }, 8000);
       if (debug1) out.calls.dvsaToken = { status: tokenRes.status, ok: tokenRes.ok, err: tokenRes.error };
       token = tokenRes.json?.access_token || "";
-
       if (token) {
         const url = `https://history.mot.api.gov.uk/v1/trade/vehicles/registration/${encodeURIComponent(vrm)}`;
         const r = await fetchWithTimeout(url, {
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "X-API-Key": process.env.DVSA_API_KEY || "",
-            "Accept": "application/json"
-          }
+          headers: { "Authorization": `Bearer ${token}`, "X-API-Key": process.env.DVSA_API_KEY || "", "Accept": "application/json" }
         }, 8000);
         if (debug1) out.calls.dvsaVehicle = { status: r.status, ok: r.ok, err: r.error };
         if (r.ok && r.json) {
@@ -159,7 +156,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---------- DVLA VES (fills year/make/fuel/colour gaps) ----------
+    // ---------- DVLA (disabled by default; behind flag) ----------
     if (useDVLA) {
       const r = await fetchWithTimeout("https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles", {
         method: "POST",
@@ -172,12 +169,11 @@ export default async function handler(req, res) {
         setIfEmpty("make", r.json.make);
         setIfEmpty("colour", r.json.colour);
         setIfEmpty("fuelType", r.json.fuelType);
-        // DVLA also gives engineCapacity (cc). Useful as a fallback engine signal.
         if (r.json.engineCapacity) setIfEmpty("engineSize", r.json.engineCapacity);
       }
     }
 
-    // ---------- VDG (rich model/variant + fitment enrichment) ----------
+    // ---------- VDG (primary source; field paths confirmed against live payload) ----------
     if (useVDG) {
       const vdgBase = ((process.env.VDG_BASE || "https://uk.api.vehicledataglobal.com")
         .trim().split(/\s+/)[0] || "https://uk.api.vehicledataglobal.com").replace(/\/+$/, "");
@@ -187,102 +183,72 @@ export default async function handler(req, res) {
       if (debug1) {
         out.calls.vdgRequest = { url: `${vdgBase}/r2/lookup?packagename=${encodeURIComponent(process.env.VDG_PACKAGE || "VehicleDetails")}&vrm=${encodeURIComponent(vrm)}&apikey=***` };
         out.calls.vdg = { status: r.status, ok: r.ok, err: r.error };
-        out.calls.vdgBodyPreview = (r.text || "").slice(0, 600);
       }
 
-      if (r.ok && r.json) {
-        let usedNested = false;
+      if (r.ok && r.json && r.json.Results) {
+        const R   = r.json.Results;
+        const VD  = R.VehicleDetails || {};
+        const VI  = VD.VehicleIdentification || {};
+        const DTD = VD.DvlaTechnicalDetails || {};
+        const VH  = VD.VehicleHistory || R.VehicleHistory || {};
+        const MD  = R.ModelDetails || {};
+        const MI  = MD.ModelIdentification || {};
+        const BDY = MD.BodyDetails || {};
+        const PWR = MD.Powertrain || {};
+        const ICE = PWR.IceDetails || {};
+        const TRN = PWR.Transmission || {};
 
-        if (r.json.Results) {
-          const R  = r.json.Results;
-          const VD = R.VehicleDetails || {};
-          const VI = VD.VehicleIdentification || {};
-          const VH = R.VehicleHistory || {};
-          const MD = R.ModelDetails || {};
-          const MI = MD.ModelIdentification || {};
+        // identity
+        setIfEmpty("make", pick(() => VI.DvlaMake, () => MI.Make));
+        setIfEmpty("model", pick(() => MI.Range, () => MI.Model, () => VI.DvlaModel));
+        setIfEmpty("variant", pick(() => MI.ModelVariant, () => MI.Series));
+        setIfEmpty("year", pick(() => VI.YearOfManufacture, () => yearOf(MI.IntroductionDate)));
+        setIfEmpty("fuelType", pick(() => PWR.FuelType, () => VI.DvlaFuelType));
+        setIfEmpty("colour", pick(() => VH?.ColourDetails?.CurrentColour, () => VI.DvlaColour));
 
-          // proven extractions (unchanged) ----------------------------------
-          setIfEmpty("make", pick(() => VI.DvlaMake, () => MI.Make));
-          setIfEmpty("model", pick(() => MI.Range, () => VI.DvlaModel, () => MI.Model));
-          setIfEmpty("variant", pick(() => MI.ModelVariant, () => MI.Series));
-          setIfEmpty("fuelType", () => VI.DvlaFuelType);
-          setIfEmpty("colour", () => VH?.ColourDetails?.CurrentColour);
-          setIfEmpty("year", pick(() => (VI.YearOfManufacture ?? "") !== "" ? String(VI.YearOfManufacture) : ""));
-
-          const dvlaModelFull = String(VI.DvlaModel || "");
-          if (dvlaModelFull) out.dvlaModel = dvlaModelFull;
-          if (!out.variant && dvlaModelFull) {
-            const base = String(MI.Range || out.model || "").trim();
-            let tail = dvlaModelFull;
-            if (base && new RegExp(`^${base}\\b`, "i").test(dvlaModelFull)) {
-              tail = dvlaModelFull.replace(new RegExp(`^${base}\\s*`, "i"), "").trim();
-            } else if (out.model && new RegExp(`^${out.model}\\b`, "i").test(dvlaModelFull)) {
-              tail = dvlaModelFull.replace(new RegExp(`^${out.model}\\s*`, "i"), "").trim();
-            }
-            tail = tail.replace(/\s{2,}/g, " ").trim();
-            if (tail && tail.length >= 3) out.variantDerived = tail;
+        const dvlaModelFull = String(VI.DvlaModel || "");
+        if (dvlaModelFull) out.dvlaModel = dvlaModelFull;
+        if (!out.variant && dvlaModelFull) {
+          const base = String(MI.Range || out.model || "").trim();
+          let tail = dvlaModelFull;
+          if (base && new RegExp(`^${base}\\b`, "i").test(dvlaModelFull)) {
+            tail = dvlaModelFull.replace(new RegExp(`^${base}\\s*`, "i"), "").trim();
           }
-
-          // ENRICHMENT: fitment-critical fields ------------------------------
-          // NOTE: VDG nests these differently per package. The candidate paths
-          // below are best guesses. Run ?debug=2 against a real reg, read
-          // out.calls.vdgResultsFull, and correct the paths to match YOUR payload.
-          const DTD = VD.DvlaTechnicalDetails || {};
-          const PWR = MD.Powertrain || VD.Powertrain || {};
-          const BDY = MD.BodyDetails || VD.BodyDetails || {};
-          const TRN = PWR.Transmission || MD.Transmission || {};
-
-          setIfEmpty("engineSize", pick(
-            () => VI.EngineCapacityCc, () => DTD.EngineCapacityCc,
-            () => PWR.IceDetails?.EngineCapacityCc, () => MI.EngineCapacity
-          ));
-          setIfEmpty("engineCode", pick(
-            () => VI.EngineNumber, () => PWR.IceDetails?.EngineDescription, () => MI.EngineFamily
-          ));
-          setIfEmpty("transmission", pick(
-            () => TRN.TransmissionType, () => PWR.TransmissionType, () => MI.Transmission
-          ));
-          setIfEmpty("bodyType", pick(
-            () => BDY.BodyStyle, () => MI.BodyStyle, () => VI.DvlaBodyType
-          ));
-          setIfEmpty("drivetrain", pick(
-            () => PWR.DriveType, () => MI.DriveType, () => BDY.DriveType
-          ));
-          setIfEmpty("chassis", pick(
-            () => MI.SeriesDescription, () => MI.Series, () => MI.PlatformCode
-          ));
-
-          if (debug2) out.calls.vdgResultsFull = R; // full dump to locate real field names
-
-          usedNested = true;
-          if (debug1) out.calls.vdgSource = "nested";
+          tail = tail.replace(/\s{2,}/g, " ").trim();
+          if (tail && tail.length >= 3) out.variantDerived = tail;
         }
 
-        // flat fallback ------------------------------------------------------
-        const data = r.json.data || r.json;
-        if (!usedNested && data && typeof data === "object") {
-          setIfEmpty("make", data.Make);
-          setIfEmpty("model", data.Model);
-          setIfEmpty("variant", data.Variant || data.Derivative || data.Trim);
-          setIfEmpty("year", data.YearOfManufacture);
-          setIfEmpty("fuelType", data.FuelType);
-          setIfEmpty("colour", data.Colour);
-          setIfEmpty("engineSize", data.EngineCapacity || data.EngineSize);
-          setIfEmpty("transmission", data.Transmission);
-          setIfEmpty("bodyType", data.BodyStyle || data.BodyType);
-          if (!out.variant && data.Model) {
-            const base = String(out.model || "").trim();
-            let tail = String(data.Model);
-            if (base && new RegExp(`^${base}\\b`, "i").test(tail)) {
-              tail = tail.replace(new RegExp(`^${base}\\s*`, "i"), "").trim();
-            }
-            tail = tail.replace(/\s{2,}/g, " ").trim();
-            if (tail && tail.length >= 3) out.variantDerived = tail;
-          }
-          if (debug1) out.calls.vdgSource = "flat";
+        // engine
+        setIfEmpty("engineSize", pick(() => ICE.EngineCapacityCc, () => DTD.EngineCapacityCc));
+        setIfEmpty("engineCode", pick(() => VI.EngineNumber, () => ICE.EngineFamily));
+        setIfEmpty("engineDescription", pick(() => ICE.EngineDescription));
+
+        // drivetrain / transmission
+        setIfEmpty("transmission", pick(() => TRN.TransmissionType));
+        setIfEmpty("gears", pick(() => TRN.NumberOfGears));
+        setIfEmpty("drivetrain", pick(() => TRN.DriveType, () => TRN.DrivingAxle));
+
+        // body
+        setIfEmpty("bodyType", pick(() => BDY.BodyStyle, () => VI.DvlaBodyType));
+        setIfEmpty("doors", pick(() => BDY.NumberOfDoors));
+        setIfEmpty("chassis", pick(() => MI.Series, () => MI.SeriesDescription));
+
+        // PLATFORM: the key cross-fitment signal (panels shared across fuel/engine variants)
+        setIfEmpty("platform", pick(() => BDY.PlatformName));
+        setIfEmpty("platformShared", pick(() => BDY.PlatformIsSharedAcrossModels));
+
+        // model production year range (use for compatible-years matching)
+        out.yearStart = yearOf(MI.StartDate) || yearOf(MI.IntroductionDate) || "";
+        out.yearEnd   = yearOf(MI.EndDate) || "";
+        if (out.yearStart || out.yearEnd) {
+          out.yearRange = `${out.yearStart || "?"}-${out.yearEnd || "present"}`;
         }
-      } else if (r.status === 404 && debug1) {
-        out.calls.vdgNotFound = true;
+
+        if (debug2) out.calls.vdgResultsFull = R;
+        if (debug1) out.calls.vdgSource = "nested";
+      } else if (debug1) {
+        out.calls.vdgStatus = r.status;
+        out.calls.vdgBodyPreview = (r.text || "").slice(0, 400);
       }
     }
 
@@ -291,7 +257,6 @@ export default async function handler(req, res) {
     out.description = [out.year, out.make, out.model, variantForDesc, out.fuelType]
       .filter(Boolean).join(" ");
 
-    // ---------- cache + return ----------
     CACHE.set(vrm, { t: Date.now(), data: out });
     res.setHeader("X-Cache", "MISS");
     return res.status(200).json(out);
